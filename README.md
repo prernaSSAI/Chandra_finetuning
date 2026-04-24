@@ -58,7 +58,7 @@ Assistant → Extracted OCR Text
 
 ---
 
-## ⚙️ Finetuning Approaches
+##  Finetuning Approaches
 
 ### 1. Full Finetuning (Vision Frozen)
 
@@ -88,7 +88,7 @@ Assistant → Extracted OCR Text
 
 ---
 
-## 🧪 Summary
+##  Summary
 
 | Approach      | Vision Layers | Trainable Params | Efficiency | Use Case         |
 | ------------- | ------------- | ---------------- | ---------- | ---------------- |
@@ -97,7 +97,7 @@ Assistant → Extracted OCR Text
 
 ---
 
-## 🚀 Usage
+##  Usage
 
 ### Training
 
@@ -113,7 +113,7 @@ python <evaluation_script>.py
 
 ---
 
-## 📈 Outputs
+##  Outputs
 
 Each training run generates:
 
