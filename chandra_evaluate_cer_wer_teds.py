@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+PageKey = Tuple[str, int]
 
 import re
 
@@ -66,31 +67,28 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
-# CONFIG / CLI
 
 @dataclass
 class EvalConfig:
     pkl_dir:        str = "/mnt/disk/ml_data/prerna/data_pkl"
-    model_path:     str = "/mnt/disk/ml_data/prerna/chandra_output/checkpoint-240"
-    split_manifest: str = "/mnt/disk/ml_data/prerna/chandra_output/split_manifest_recovered.json"
+    model_path:     str = "/mnt/disk/ml_data/prerna/chandra_output/best_model"
+    split_manifest: str = "/mnt/disk/ml_data/prerna/chandra_output/split_manifest.json"
     output_dir:     str = "/mnt/disk/ml_data/prerna/chandra_eval_test"
     log_file:       Optional[str] = "/mnt/disk/ml_data/prerna/chandra_eval_test/eval.log"
-    eval_split:     str = "test"
+    eval_split:     str = "all"
 
-    batch_size:     int  = 1
-    num_workers:    int  = 0
-    max_image_size: int  = 512
-    max_target_length: int = 2048
+    batch_size:     int = 1
+    num_workers:    int = 0
 
-    max_generation_length: int   = 12384 # 12384
-    num_beams:             int   = 1
-    do_sample:             bool  = False
+    max_generation_length: int = 12384
+    num_beams:             int = 1
+    do_sample:             bool = False
     temperature:           float = 1.0
     top_p:                 float = 1.0
 
     compute_loss: bool = False
-    seed:         int  = 42
-    device:       str  = "auto"
+    seed:         int = 42
+    device:       str = "auto"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -103,33 +101,26 @@ def parse_args() -> EvalConfig:
     )
 
     parser.add_argument("--pkl_dir", default="/mnt/disk/ml_data/prerna/data_pkl")
-    parser.add_argument("--model_path", default="/mnt/disk/ml_data/prerna/chandra_output/checkpoint-240")
-    parser.add_argument("--split_manifest", default="/mnt/disk/ml_data/prerna/chandra_output/split_manifest_recovered.json")
+    parser.add_argument("--model_path", default="/mnt/disk/ml_data/prerna/chandra_output/best_model")
+    parser.add_argument("--split_manifest", default="/mnt/disk/ml_data/prerna/chandra_output/split_manifest.json")
     parser.add_argument("--output_dir", default="/mnt/disk/ml_data/prerna/chandra_eval_test")
     parser.add_argument("--log_file", default="/mnt/disk/ml_data/prerna/chandra_eval_test/eval.log")
-    parser.add_argument(
-        "--eval_split",
-        default="test",
-        
-    )
+    parser.add_argument("--eval_split", default="all", choices=["train", "valid", "test", "all"])
 
-    parser.add_argument("--batch_size",            type=int,   default=1)
-    parser.add_argument("--num_workers",           type=int,   default=0)
-    parser.add_argument("--max_image_size",        type=int,   default=512)
-    parser.add_argument("--max_target_length",     type=int,   default=2048)
-    parser.add_argument("--max_generation_length", type=int,   default=12384)
-    parser.add_argument("--num_beams",             type=int,   default=1)
-    parser.add_argument("--do_sample",             action="store_true")
-    parser.add_argument("--temperature",           type=float, default=1.0)
-    parser.add_argument("--top_p",                 type=float, default=1.0)
-    parser.add_argument("--compute_loss",          action="store_true")
-    parser.add_argument("--seed",                  type=int,   default=42)
-    parser.add_argument("--device",                default="auto")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_generation_length", type=int, default=12384)
+    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--do_sample", action="store_true")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--compute_loss", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto")
 
     args = parser.parse_args()
-    return EvalConfig(**{k: v for k, v in vars(args).items()})
+    return EvalConfig(**vars(args))
 
-# LOGGING / REPRODUCIBILITY
 
 def setup_logging(log_file: Optional[str]) -> logging.Logger:
     logger = logging.getLogger("chandra_eval")
@@ -140,6 +131,7 @@ def setup_logging(log_file: Optional[str]) -> logging.Logger:
         fmt="%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
@@ -171,10 +163,6 @@ def resolve_device(device_str: str) -> torch.device:
     return torch.device(device_str)
 
 
-# SPLIT MANIFEST
-
-PageKey = Tuple[str, int]   # (doc_id, page_idx)
-
 
 def load_split_page_keys(manifest_path: str, split: str) -> FrozenSet[PageKey]:
     manifest_file = Path(manifest_path)
@@ -203,18 +191,19 @@ def load_split_page_keys(manifest_path: str, split: str) -> FrozenSet[PageKey]:
 
     log.info(
         "Manifest loaded: split_mode=%s | requested=%s | %d pages",
-        split_mode, split, len(page_keys),
+        split_mode,
+        split,
+        len(page_keys),
     )
     log.info(
         "  n_train=%d | n_valid=%d | n_test=%d",
         manifest.get("n_train", "?"),
         manifest.get("n_valid", "?"),
-        manifest.get("n_test",  "?"),
+        manifest.get("n_test", "?"),
     )
+
     return page_keys
 
-
-# DATA LOADING
 
 def _normalize_content(content: Any) -> List[Dict]:
     if isinstance(content, str):
@@ -230,51 +219,65 @@ def _validate_page_sample(page_sample: Any, fname: str, page_idx: int) -> bool:
     if not isinstance(page_sample, dict):
         log.warning("  [SKIP] %s[%d]: not a dict", fname, page_idx)
         return False
+
     messages = page_sample.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
         log.warning("  [SKIP] %s[%d]: 'messages' missing or < 2 elements", fname, page_idx)
         return False
+
     user_msg, asst_msg = messages[0], messages[1]
+
     if user_msg.get("role") != "user":
         log.warning("  [SKIP] %s[%d]: first role is not user", fname, page_idx)
         return False
+
     if asst_msg.get("role") != "assistant":
         log.warning("  [SKIP] %s[%d]: second role is not assistant", fname, page_idx)
         return False
+
     user_content = _normalize_content(user_msg.get("content", []))
+
     has_image = any(
         isinstance(block, dict)
         and block.get("type") == "image"
         and isinstance(block.get("image"), (Image.Image, bytes, bytearray, str))
         for block in user_content
     )
+
     if not has_image:
         log.warning("  [SKIP] %s[%d]: no valid image in user message", fname, page_idx)
         return False
+
     asst_content = _normalize_content(asst_msg.get("content", []))
+
     has_text = any(
         isinstance(block, dict)
         and block.get("type") == "text"
         and block.get("text", "").strip()
         for block in asst_content
     )
+
     if not has_text:
         log.warning("  [SKIP] %s[%d]: no GT text in assistant message", fname, page_idx)
         return False
+
     return True
 
 
-def _ensure_images_rgb(messages: List[Dict], max_image_size: int = 512) -> List[Dict]:
+def _ensure_images_rgb(messages: List[Dict]) -> List[Dict]:
     user_content = messages[0].get("content", [])
+
     if not isinstance(user_content, list):
         return messages
 
     for block in user_content:
         if not isinstance(block, dict) or block.get("type") != "image":
             continue
+
         img_val = block.get("image")
         if img_val is None:
             continue
+
         try:
             if isinstance(img_val, Image.Image):
                 img = img_val.convert("RGB")
@@ -285,14 +288,9 @@ def _ensure_images_rgb(messages: List[Dict], max_image_size: int = 512) -> List[
             else:
                 continue
 
-            width, height = img.size
-            if max(width, height) > max_image_size:
-                scale = max_image_size / max(width, height)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                img = img.resize((new_width, new_height), Image.LANCZOS)
-
+            img.info["dpi"] = (600, 600)
             block["image"] = img
+
         except Exception as exc:
             log.debug("  Image conversion failed: %s", exc)
 
@@ -301,6 +299,7 @@ def _ensure_images_rgb(messages: List[Dict], max_image_size: int = 512) -> List[
 
 def _extract_gt_text(messages: List[Dict]) -> str:
     assistant_content = _normalize_content(messages[1].get("content", []))
+
     parts = [
         block["text"]
         for block in assistant_content
@@ -308,15 +307,16 @@ def _extract_gt_text(messages: List[Dict]) -> str:
         and block.get("type") == "text"
         and block.get("text", "").strip()
     ]
+
     return "\n".join(parts)
 
 
 def load_eval_samples(
     pkl_dir: str,
     page_keys: FrozenSet[PageKey],
-    max_image_size: int = 512,
 ) -> List[Dict[str, Any]]:
     pkl_dir_path = Path(pkl_dir)
+
     if not pkl_dir_path.is_dir():
         raise FileNotFoundError(f"pkl_dir not found: {pkl_dir}")
 
@@ -334,6 +334,7 @@ def load_eval_samples(
             continue
 
         files_scanned += 1
+
         try:
             with pkl_path.open("rb") as f:
                 data = pickle.load(f)
@@ -346,6 +347,7 @@ def load_eval_samples(
             continue
 
         loaded_from_file = 0
+
         for page_idx, page_sample in enumerate(data):
             if (doc_id, page_idx) not in page_keys:
                 continue
@@ -354,19 +356,17 @@ def load_eval_samples(
                 pages_skipped += 1
                 continue
 
-            messages = _ensure_images_rgb(
-                page_sample["messages"],
-                max_image_size=max_image_size,
-            )
+            messages = _ensure_images_rgb(page_sample["messages"])
             gt_text = _extract_gt_text(messages)
 
             samples.append({
                 "messages": messages,
-                "gt_text":  gt_text,
-                "file":     fname,
-                "doc_id":   doc_id,
+                "gt_text": gt_text,
+                "file": fname,
+                "doc_id": doc_id,
                 "page_idx": page_idx,
             })
+
             loaded_from_file += 1
 
         if loaded_from_file:
@@ -374,6 +374,7 @@ def load_eval_samples(
 
     found_keys: Set[PageKey] = {(s["doc_id"], s["page_idx"]) for s in samples}
     missing = page_keys - found_keys
+
     if missing:
         log.warning(
             "  [MISSING] %d page(s) from manifest not found on disk: %s",
@@ -383,12 +384,13 @@ def load_eval_samples(
 
     log.info(
         "Load summary: %d file(s) scanned | %d page(s) skipped | %d sample(s) ready",
-        files_scanned, pages_skipped, len(samples),
+        files_scanned,
+        pages_skipped,
+        len(samples),
     )
+
     return samples
 
-
-# DATASET / COLLATE
 
 class ChandraEvalDataset(Dataset):
     def __init__(self, samples: List[Dict[str, Any]]):
@@ -402,9 +404,9 @@ class ChandraEvalDataset(Dataset):
             s = self.samples[idx]
             return {
                 "messages": s["messages"],
-                "gt_text":  s["gt_text"],
-                "file":     s["file"],
-                "doc_id":   s["doc_id"],
+                "gt_text": s["gt_text"],
+                "file": s["file"],
+                "doc_id": s["doc_id"],
                 "page_idx": s["page_idx"],
             }
         except Exception as exc:
@@ -413,17 +415,18 @@ class ChandraEvalDataset(Dataset):
 
 
 class EvalCollateFn:
-    def __init__(self, processor: Any, max_target_length: int, compute_loss: bool = False):
+    def __init__(self, processor: Any, compute_loss: bool = False):
         self.processor = processor
-        self.max_target_length = max_target_length
         self.compute_loss = compute_loss
 
     def __call__(self, batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
         valid = [item for item in batch if item is not None]
+
         if not valid:
             return None
 
         prompt_convs = [[item["messages"][0]] for item in valid]
+
         try:
             prompt_inputs = self.processor.apply_chat_template(
                 prompt_convs,
@@ -432,20 +435,19 @@ class EvalCollateFn:
                 return_dict=True,
                 return_tensors="pt",
                 padding=True,
-                truncation=True,
-                max_length=self.max_target_length,
+                truncation=False,
             )
         except Exception as exc:
             log.warning("  [COLLATE] prompt apply_chat_template failed: %s", exc)
             return None
 
         result: Dict[str, Any] = {
-            "input_ids":        prompt_inputs["input_ids"],
-            "attention_mask":   prompt_inputs["attention_mask"],
-            "gt_texts":         [item["gt_text"] for item in valid],
-            "files":            [item["file"] for item in valid],
-            "doc_ids":          [item["doc_id"] for item in valid],
-            "page_idxs":        [item["page_idx"] for item in valid],
+            "input_ids": prompt_inputs["input_ids"],
+            "attention_mask": prompt_inputs["attention_mask"],
+            "gt_texts": [item["gt_text"] for item in valid],
+            "files": [item["file"] for item in valid],
+            "doc_ids": [item["doc_id"] for item in valid],
+            "page_idxs": [item["page_idx"] for item in valid],
             "prompt_input_ids": prompt_inputs["input_ids"].clone(),
         }
 
@@ -464,6 +466,7 @@ class EvalCollateFn:
         prompt_inputs: Dict[str, Any],
     ) -> Dict[str, Any]:
         full_convs = [item["messages"] for item in valid]
+
         try:
             full_inputs = self.processor.apply_chat_template(
                 full_convs,
@@ -472,14 +475,14 @@ class EvalCollateFn:
                 return_dict=True,
                 return_tensors="pt",
                 padding=True,
-                truncation=True,
-                max_length=self.max_target_length,
+                truncation=False,
             )
         except Exception as exc:
             log.warning("  [COLLATE] full-conversation apply_chat_template failed: %s", exc)
             return {}
 
         labels = full_inputs["input_ids"].clone()
+
         prompt_len = int((prompt_inputs["attention_mask"][0] == 1).sum().item())
         labels[:, :prompt_len] = -100
 
@@ -488,17 +491,17 @@ class EvalCollateFn:
             labels[labels == pad_token_id] = -100
 
         extra: Dict[str, Any] = {
-            "loss_input_ids":      full_inputs["input_ids"],
+            "loss_input_ids": full_inputs["input_ids"],
             "loss_attention_mask": full_inputs["attention_mask"],
-            "labels":              labels,
+            "labels": labels,
         }
+
         for key in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
             if key in full_inputs:
                 extra[f"loss_{key}"] = full_inputs[key]
 
         return extra
 
-# MODEL LOADING
 
 def load_model_and_processor(
     model_path: str,
@@ -506,6 +509,7 @@ def load_model_and_processor(
 ) -> Tuple[nn.Module, Any]:
     if not HF_AVAILABLE:
         raise ImportError("transformers not installed.")
+
     if not UNSLOTH_AVAILABLE:
         raise ImportError("unsloth not installed. Run: pip install unsloth")
 
@@ -515,7 +519,6 @@ def load_model_and_processor(
 
     dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
 
-    # Processor: try checkpoint first, then fall back to base model
     try:
         log.info("Loading processor from checkpoint: %s", model_path)
         processor = AutoProcessor.from_pretrained(model_path)
@@ -528,6 +531,7 @@ def load_model_and_processor(
         processor.tokenizer.padding_side = "right"
 
     log.info("Loading Unsloth model from: %s", model_path)
+
     model, _ = FastVisionModel.from_pretrained(
         model_name=model_path,
         torch_dtype=dtype,
@@ -540,25 +544,32 @@ def load_model_and_processor(
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
+
     log.info(
         "Model ready — %s params | dtype=%s | device=%s",
         f"{n_params:,}",
         next(model.parameters()).dtype,
         device,
     )
+
     return model, processor
 
 
-# DEVICE TRANSFER HELPERS
-
 _GEN_KEYS = frozenset([
-    "input_ids", "attention_mask",
-    "pixel_values", "image_grid_thw", "mm_token_type_ids",
+    "input_ids",
+    "attention_mask",
+    "pixel_values",
+    "image_grid_thw",
+    "mm_token_type_ids",
 ])
 
 _LOSS_KEYS = frozenset([
-    "loss_input_ids", "loss_attention_mask", "labels",
-    "loss_pixel_values", "loss_image_grid_thw", "loss_mm_token_type_ids",
+    "loss_input_ids",
+    "loss_attention_mask",
+    "labels",
+    "loss_pixel_values",
+    "loss_image_grid_thw",
+    "loss_mm_token_type_ids",
 ])
 
 
@@ -573,7 +584,6 @@ def _batch_to_device(
         if key in keys and isinstance(value, torch.Tensor)
     }
 
-# METRICS
 
 def _lxml_available() -> bool:
     try:
@@ -587,11 +597,8 @@ def html_to_plain_text(html: str) -> str:
     if BS4_AVAILABLE:
         parser = "lxml" if _lxml_available() else "html.parser"
         return BeautifulSoup(html, parser).get_text(separator=" ").strip()
-    import re
+
     return re.sub(r"<[^>]+>", " ", html).strip()
-
-
-# Tree-Edit-Distance-based Similarity for HTML tables.
 
 
 class TableTree(Tree):
@@ -633,13 +640,17 @@ class TEDSConfig(Config):
 
 def _normalize_html_table(html: str) -> Optional[Any]:
     if not BS4_AVAILABLE:
-        raise ImportError("beautifulsoup4 is required for official TEDS. Run: pip install beautifulsoup4 lxml apted")
+        raise ImportError(
+            "beautifulsoup4 is required for official TEDS. Run: pip install beautifulsoup4 lxml apted"
+        )
 
     parser = "lxml" if _lxml_available() else "html.parser"
     soup = BeautifulSoup(html or "", parser)
     table = soup.find("table")
+
     if table is None:
         return None
+
     return table
 
 
@@ -649,6 +660,7 @@ def _cell_text(cell: Any) -> str:
 
 def html_to_tree(html: str) -> Optional[TableTree]:
     table = _normalize_html_table(html)
+
     if table is None:
         return None
 
@@ -657,6 +669,7 @@ def html_to_tree(html: str) -> Optional[TableTree]:
             return None
 
         children: List[TableTree] = []
+
         for child_node in node.children:
             child = convert(child_node)
             if child is not None:
@@ -664,7 +677,6 @@ def html_to_tree(html: str) -> Optional[TableTree]:
 
         tag = node.name.lower()
 
-        # TEDS treats th like td for cell comparison.
         if tag in ("td", "th"):
             return TableTree(
                 "td",
@@ -684,16 +696,9 @@ def count_nodes(node: TableTree) -> int:
 
 
 def compute_teds(pred: str, gt: str) -> float:
-    """
-    Official-style TEDS:
-      TEDS = 1 - edit_distance(pred_tree, gt_tree) / max(node_count(pred_tree), node_count(gt_tree))
-
-    Returns 0.0 if either prediction or ground truth has no valid <table>.
-    """
     if not APTED_AVAILABLE:
         raise ImportError("apted is required for official TEDS. Run: pip install apted")
 
-    # Fast skip: official TEDS is only defined for HTML tables.
     if "<table" not in (pred or "").lower() or "<table" not in (gt or "").lower():
         return 0.0
 
@@ -704,30 +709,36 @@ def compute_teds(pred: str, gt: str) -> float:
         return 0.0
 
     max_nodes = max(count_nodes(pred_tree), count_nodes(gt_tree))
+
     if max_nodes == 0:
         return 0.0
 
     distance = APTED(pred_tree, gt_tree, TEDSConfig()).compute_edit_distance()
     score = 1.0 - (float(distance) / float(max_nodes))
 
-    # Guard against tiny numeric drift.
     return round(max(0.0, min(1.0, score)), 6)
 
 
 def _edit_distance_rate(ref: List[Any], hyp: List[Any]) -> float:
     if not ref:
         return 0.0 if not hyp else 1.0
+
     n, m = len(ref), len(hyp)
     dp = list(range(m + 1))
+
     for i in range(1, n + 1):
         prev, dp[0] = dp[0], i
+
         for j in range(1, m + 1):
             tmp = dp[j]
+
             if ref[i - 1] == hyp[j - 1]:
                 dp[j] = prev
             else:
                 dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+
             prev = tmp
+
     return dp[m] / n
 
 
@@ -736,12 +747,14 @@ def compute_cer(pred: str, gt: str) -> float:
         try:
             transform = jiwer.Compose([jiwer.ReduceToListOfListOfChars()])
             return jiwer.wer(
-                [gt], [pred],
+                [gt],
+                [pred],
                 truth_transform=transform,
                 hypothesis_transform=transform,
             )
         except Exception:
             pass
+
     return _edit_distance_rate(list(gt), list(pred))
 
 
@@ -751,19 +764,20 @@ def compute_wer(pred: str, gt: str) -> float:
             return jiwer.wer([gt], [pred])
         except Exception:
             pass
+
     return _edit_distance_rate(gt.split(), pred.split())
 
 
 def compute_metrics(pred: str, gt: str) -> Dict[str, float]:
     pred_plain = html_to_plain_text(pred)
     gt_plain = html_to_plain_text(gt)
+
     return {
-        "cer":  round(min(compute_cer(pred_plain, gt_plain), 999.0), 6),
-        "wer":  round(min(compute_wer(pred_plain, gt_plain), 999.0), 6),
+        "cer": round(min(compute_cer(pred_plain, gt_plain), 999.0), 6),
+        "wer": round(min(compute_wer(pred_plain, gt_plain), 999.0), 6),
         "teds": round(compute_teds(pred, gt), 6),
     }
 
-# OPTIONAL LOSS
 
 def compute_batch_loss(
     model: nn.Module,
@@ -772,26 +786,31 @@ def compute_batch_loss(
 ) -> Optional[float]:
     if "labels" not in batch:
         return None
+
     try:
         loss_inputs = _batch_to_device(batch, device, _LOSS_KEYS)
+
         forward_kwargs: Dict[str, torch.Tensor] = {
-            "input_ids":      loss_inputs["loss_input_ids"],
+            "input_ids": loss_inputs["loss_input_ids"],
             "attention_mask": loss_inputs["loss_attention_mask"],
-            "labels":         loss_inputs["labels"],
+            "labels": loss_inputs["labels"],
         }
+
         for key in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
             src = f"loss_{key}"
             if src in loss_inputs:
                 forward_kwargs[key] = loss_inputs[src]
+
         outputs = model(**forward_kwargs)
+
         if outputs.loss is not None and not torch.isnan(outputs.loss):
             return float(outputs.loss.item())
+
     except Exception as exc:
         log.warning("  [LOSS] Forward pass failed: %s", exc)
+
     return None
 
-
-# GENERATION HELPERS
 
 def decode_generated_text(
     generated_ids: torch.Tensor,
@@ -799,6 +818,7 @@ def decode_generated_text(
     tokenizer: Any,
 ) -> List[str]:
     decoded: List[str] = []
+
     for row_idx in range(generated_ids.shape[0]):
         full_ids = generated_ids[row_idx]
         prompt_ids = prompt_input_ids[row_idx]
@@ -808,6 +828,7 @@ def decode_generated_text(
             full_ids.shape[0] >= prompt_len
             and torch.equal(full_ids[:prompt_len].cpu(), prompt_ids.cpu())
         )
+
         ids_to_decode = full_ids[prompt_len:] if use_trimmed else full_ids
 
         try:
@@ -815,12 +836,11 @@ def decode_generated_text(
         except Exception as exc:
             log.warning("  [DECODE sample=%d] %s", row_idx, exc)
             text = ""
+
         decoded.append(text)
 
     return decoded
 
-
-# EVALUATION LOOP
 
 def run_evaluation(
     model: nn.Module,
@@ -830,14 +850,16 @@ def run_evaluation(
     cfg: EvalConfig,
 ) -> List[Dict[str, Any]]:
     model.eval()
+
     results: List[Dict[str, Any]] = []
     batch_errors = 0
 
     gen_params: Dict[str, Any] = {
         "max_new_tokens": cfg.max_generation_length,
-        "num_beams":      cfg.num_beams,
-        "do_sample":      cfg.do_sample,
+        "num_beams": cfg.num_beams,
+        "do_sample": cfg.do_sample,
     }
+
     if cfg.do_sample:
         gen_params["temperature"] = cfg.temperature
         gen_params["top_p"] = cfg.top_p
@@ -854,12 +876,14 @@ def run_evaluation(
             gen_inputs = _batch_to_device(batch, device, _GEN_KEYS)
 
             t0 = time.perf_counter()
+
             try:
                 generated_ids = model.generate(**gen_inputs, **gen_params)
             except Exception as exc:
                 log.warning("  [Batch %d] Generation failed: %s", batch_idx, exc)
                 batch_errors += batch_size
                 continue
+
             latency_s = time.perf_counter() - t0
 
             predictions = decode_generated_text(
@@ -869,6 +893,7 @@ def run_evaluation(
             )
 
             batch_loss: Optional[float] = None
+
             if cfg.compute_loss:
                 batch_loss = compute_batch_loss(model, batch, device)
 
@@ -880,16 +905,17 @@ def run_evaluation(
                 metrics = compute_metrics(pred, gt)
 
                 row: Dict[str, Any] = {
-                    "file":         batch["files"][i],
-                    "doc_id":       batch["doc_ids"][i],
-                    "page_idx":     batch["page_idxs"][i],
-                    "prediction":   pred,
+                    "file": batch["files"][i],
+                    "doc_id": batch["doc_ids"][i],
+                    "page_idx": batch["page_idxs"][i],
+                    "prediction": pred,
                     "ground_truth": gt,
-                    "cer":          metrics["cer"],
-                    "wer":          metrics["wer"],
-                    "teds":         metrics["teds"],
-                    "latency_s":    round(per_sample_latency, 4),
+                    "cer": metrics["cer"],
+                    "wer": metrics["wer"],
+                    "teds": metrics["teds"],
+                    "latency_s": round(per_sample_latency, 4),
                 }
+
                 if batch_loss is not None:
                     row["loss"] = round(batch_loss, 6)
 
@@ -897,6 +923,7 @@ def run_evaluation(
 
             if TQDM_AVAILABLE and results:
                 n = len(results)
+
                 iterator.set_postfix(
                     cer=f"{sum(r['cer'] for r in results) / n:.3f}",
                     wer=f"{sum(r['wer'] for r in results) / n:.3f}",
@@ -905,36 +932,36 @@ def run_evaluation(
 
     log.info(
         "Evaluation complete: %d samples evaluated | %d batch/sample errors skipped",
-        len(results), batch_errors,
+        len(results),
+        batch_errors,
     )
+
     return results
 
-
-# AGGREGATION / SAVING
 
 def compute_aggregate(results: List[Dict[str, Any]], n_requested: int) -> Dict[str, Any]:
     if not results:
         return {
-            "sample_count":  0,
+            "sample_count": 0,
             "skipped_count": n_requested,
-            "avg_cer":       None,
-            "avg_wer":       None,
-            "avg_teds":      None,
+            "avg_cer": None,
+            "avg_wer": None,
+            "avg_teds": None,
             "avg_latency_s": None,
-            "avg_loss":      None,
+            "avg_loss": None,
         }
 
     n = len(results)
     losses = [row["loss"] for row in results if "loss" in row]
 
     return {
-        "sample_count":  n,
+        "sample_count": n,
         "skipped_count": n_requested - n,
-        "avg_cer":       round(sum(r["cer"] for r in results) / n, 6),
-        "avg_wer":       round(sum(r["wer"] for r in results) / n, 6),
-        "avg_teds":      round(sum(r["teds"] for r in results) / n, 6),
+        "avg_cer": round(sum(r["cer"] for r in results) / n, 6),
+        "avg_wer": round(sum(r["wer"] for r in results) / n, 6),
+        "avg_teds": round(sum(r["teds"] for r in results) / n, 6),
         "avg_latency_s": round(sum(r["latency_s"] for r in results) / n, 4),
-        "avg_loss":      round(sum(losses) / len(losses), 6) if losses else None,
+        "avg_loss": round(sum(losses) / len(losses), 6) if losses else None,
     }
 
 
@@ -967,7 +994,6 @@ def save_results(
 
     log.info("Saved outputs to: %s", output_dir.resolve())
 
-# MAIN
 
 def main(cfg: EvalConfig) -> None:
     global log
@@ -976,77 +1002,115 @@ def main(cfg: EvalConfig) -> None:
     log.info("=" * 70)
     log.info("CHANDRA OCR — EVALUATION  (CER / WER / TEDS)")
     log.info("=" * 70)
+
     for key, value in cfg.to_dict().items():
         log.info("  %-24s: %s", key, value)
+
     log.info("=" * 70)
 
     if not JIWER_AVAILABLE:
         log.warning("jiwer not installed — using Python edit-distance fallback for CER/WER")
+
     if not BS4_AVAILABLE:
-        log.warning("beautifulsoup4 not installed — official TEDS will fail. Run: pip install beautifulsoup4 lxml apted")
+        log.warning(
+            "beautifulsoup4 not installed — official TEDS will fail. "
+            "Run: pip install beautifulsoup4 lxml apted"
+        )
+
     if not APTED_AVAILABLE:
         log.warning("apted not installed — official TEDS will fail. Run: pip install apted")
 
     set_seed(cfg.seed)
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
-    page_keys = load_split_page_keys(cfg.split_manifest, split=cfg.eval_split)
-    if not page_keys:
-        log.error("No pages found for split '%s' in manifest — exiting.", cfg.eval_split)
-        sys.exit(1)
-
-    samples = load_eval_samples(
-        cfg.pkl_dir,
-        page_keys,
-        max_image_size=cfg.max_image_size,
-    )
-    if not samples:
-        log.error("No valid evaluation samples loaded — exiting.")
-        sys.exit(1)
-
-    log.info(
-        "Evaluation dataset: %d / %d manifest pages loaded  (split=%s)",
-        len(samples), len(page_keys), cfg.eval_split,
-    )
-
     device = resolve_device(cfg.device)
     log.info("Using device: %s", device)
 
     model, processor = load_model_and_processor(cfg.model_path, device)
 
-    dataset = ChandraEvalDataset(samples)
-    collate_fn = EvalCollateFn(
-        processor=processor,
-        max_target_length=cfg.max_target_length,
-        compute_loss=cfg.compute_loss,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
-    )
+    splits_to_run = ["train", "valid", "test"] if cfg.eval_split == "all" else [cfg.eval_split]
+    all_aggregates: Dict[str, Any] = {}
 
-    results = run_evaluation(model, processor, loader, device, cfg)
-    aggregate = compute_aggregate(results, n_requested=len(samples))
-    save_results(results, aggregate, cfg)
+    for split in splits_to_run:
+        log.info("")
+        log.info("=" * 70)
+        log.info("EVALUATING SPLIT: %s", split.upper())
+        log.info("=" * 70)
+
+        try:
+            page_keys = load_split_page_keys(cfg.split_manifest, split=split)
+        except Exception as exc:
+            log.error("  Failed to load manifest for split '%s': %s — skipping.", split, exc)
+            continue
+
+        if not page_keys:
+            log.warning("  No pages found for split '%s' — skipping.", split)
+            continue
+
+        samples = load_eval_samples(cfg.pkl_dir, page_keys)
+
+        if not samples:
+            log.warning("  No valid samples loaded for split '%s' — skipping.", split)
+            continue
+
+        log.info("  %d / %d pages loaded for split '%s'", len(samples), len(page_keys), split)
+
+        split_output_dir = str(Path(cfg.output_dir) / split)
+        split_cfg = EvalConfig(**{**cfg.to_dict(), "eval_split": split, "output_dir": split_output_dir})
+
+        dataset = ChandraEvalDataset(samples)
+
+        collate_fn = EvalCollateFn(
+            processor=processor,
+            compute_loss=cfg.compute_loss,
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        results = run_evaluation(model, processor, loader, device, split_cfg)
+        aggregate = compute_aggregate(results, n_requested=len(samples))
+        save_results(results, aggregate, split_cfg)
+
+        all_aggregates[split] = aggregate
+
+        log.info(
+            "  [%s] CER=%.4f | WER=%.4f | TEDS=%.4f | n=%d",
+            split,
+            aggregate["avg_cer"] or 0,
+            aggregate["avg_wer"] or 0,
+            aggregate["avg_teds"] or 0,
+            aggregate["sample_count"],
+        )
+
+    combined_path = Path(cfg.output_dir) / "all_splits_summary.json"
+
+    with combined_path.open("w", encoding="utf-8") as f:
+        json.dump(all_aggregates, f, indent=2)
 
     log.info("")
     log.info("=" * 70)
-    log.info("EVALUATION COMPLETE  [split=%s]", cfg.eval_split)
+    log.info("ALL SPLITS COMPLETE")
     log.info("=" * 70)
-    log.info("  Samples evaluated : %s", aggregate["sample_count"])
-    log.info("  Samples skipped   : %s", aggregate["skipped_count"])
-    if aggregate["sample_count"]:
-        log.info("  Avg CER           : %.4f", aggregate["avg_cer"])
-        log.info("  Avg WER           : %.4f", aggregate["avg_wer"])
-        log.info("  Avg TEDS           : %.4f", aggregate["avg_teds"])
-        log.info("  Avg Latency       : %.4f s/sample", aggregate["avg_latency_s"])
-        if aggregate["avg_loss"] is not None:
-            log.info("  Avg Val Loss      : %.4f", aggregate["avg_loss"])
-    log.info("  Output dir        : %s", Path(cfg.output_dir).resolve())
+
+    for split, agg in all_aggregates.items():
+        if agg["sample_count"]:
+            log.info(
+                "  [%-5s] CER=%.4f | WER=%.4f | TEDS=%.4f | n=%d",
+                split,
+                agg["avg_cer"],
+                agg["avg_wer"],
+                agg["avg_teds"],
+                agg["sample_count"],
+            )
+
+    log.info("  Summary → %s", combined_path.resolve())
     log.info("=" * 70)
 
 
