@@ -1,0 +1,9 @@
+unsloth
+transformers==4.57.1
+trl==0.22.2
+datasets==4.3.0
+pillow
+pymupdf
+beautifulsoup4
+lxml
+
