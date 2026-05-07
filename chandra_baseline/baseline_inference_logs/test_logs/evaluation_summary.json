@@ -1,0 +1,9 @@
+{
+  "sample_count": 36,
+  "skipped_count": 0,
+  "avg_cer": 0.065535,
+  "avg_wer": 0.066471,
+  "avg_teds": 0.701732,
+  "avg_latency_s": 150.725,
+  "avg_loss": null
+}
