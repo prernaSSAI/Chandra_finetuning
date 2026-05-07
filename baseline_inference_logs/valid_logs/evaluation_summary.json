@@ -1,9 +1,0 @@
-{
-  "sample_count": 35,
-  "skipped_count": 0,
-  "avg_cer": 0.106648,
-  "avg_wer": 0.097132,
-  "avg_teds": 0.754571,
-  "avg_latency_s": 148.5632,
-  "avg_loss": null
-}
