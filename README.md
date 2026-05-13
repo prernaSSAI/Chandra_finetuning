@@ -63,6 +63,17 @@ Use `--max-steps -1 --num-train-epochs 1` for epoch-based training.
 
 ## Inference And Evaluation
 
+The repository supports two inference paths:
+
+1. **Normal inference** using `infer_chandra.py`
+2. **vLLM inference** using `inf_vllm.py`
+
+Use normal inference when you want the existing Hugging Face/Unsloth generation
+flow. Use vLLM inference when you want to run generation through the vLLM-based
+path.
+
+### Normal Inference
+
 ```bash
 python infer_chandra.py \
   --dataset data/chandra_splits/test \
@@ -92,7 +103,57 @@ python infer_chandra.py \
   --reference-field markdown
 ```
 
-Metrics:
+### vLLM Inference
+
+Use `inf_vllm.py` for the vLLM-based inference flow. This path is useful when
+you want faster generation or want to compare the normal inference output with
+the vLLM output on the same test split.
+
+```bash
+python inf_vllm.py \
+  --dataset data/chandra_splits/test \
+  --model-name datalab-to/chandra \
+  --adapter outputs/chandra_lora \
+  --output vllm_predictions.csv \
+  --metrics cer,wer,teds,table_teds
+```
+
+When comparing normal inference and vLLM inference, keep the dataset, model,
+adapter, output path, and metrics arguments consistent between both runs.
+
+Recommended comparison flow:
+
+```bash
+# Normal inference
+python infer_chandra.py \
+  --dataset data/chandra_splits/test \
+  --model-name datalab-to/chandra \
+  --adapter outputs/chandra_lora \
+  --output normal_predictions.jsonl \
+  --metrics cer,wer,teds,table_teds
+
+# vLLM inference
+python inf_vllm.py \
+  --dataset data/chandra_splits/test \
+  --model-name datalab-to/chandra \
+  --adapter outputs/chandra_lora \
+  --output vllm_predictions.csv \
+  --metrics cer,wer,teds,table_teds
+```
+
+### Switching Between Normal And vLLM Inference
+
+To switch between inference modes, use the corresponding script:
+
+```text
+infer_chandra.py  -> normal inference
+inf_vllm.py       -> vLLM inference
+```
+
+Both inference paths should follow the same dataset and output conventions so
+that results can be compared directly.
+
+### Metrics
 
 - `cer`: normalized character edit distance.
 - `wer`: normalized whitespace-token word edit distance.
