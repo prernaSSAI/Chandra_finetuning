@@ -18,7 +18,7 @@ from chandra_finetune.data import (
 from chandra_finetune.generation import GenerationSettings, generate_text
 from chandra_finetune.metrics import aggregate_metrics, clean_html, compute_metrics, parse_metric_names
 from chandra_finetune.modeling import load_inference_model
-from chandra_baseline.prompts import PROMPT_MAPPING
+from prompts import PROMPT_MAPPING
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--references-json", help="Optional page reference JSON for --pdf inputs.")
     parser.add_argument("--reference-field", default="markdown", help="Reference text field in --references-json.")
     parser.add_argument("--page-range", help='PDF pages, for example "1-5,7,9".')
-    parser.add_argument("--dpi", type=int, default=200, help="PDF render DPI.")
+    parser.add_argument("--dpi", type=int, default=600, help="PDF render DPI.")
     parser.add_argument("--prompt-type", default="ocr", choices=sorted(PROMPT_MAPPING), help="Prompt for image/PDF inputs.")
     parser.add_argument("--override-prompt", help="Force this prompt for every sample.")
 
@@ -39,20 +39,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Base model checkpoint.")
     parser.add_argument("--adapter", help="LoRA adapter directory or HF id saved by train_chandra.py.")
-    parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--load-in-4bit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load model in 4-bit QLoRA mode. Default is off.",
+    )
     parser.add_argument("--device", default="auto", help='Device for tokenizer tensors: auto, cuda, cpu, or "none".')
 
     parser.add_argument("--max-samples", type=int, default=None)
 
-    parser.add_argument("--output", default="predictions.jsonl", help="Output path. Use .csv for CSV.")
+    parser.add_argument("--output", default="predictions.json", help="Output path. Use .csv for CSV or .jsonl for JSON lines.")
     parser.add_argument("--metrics", default="cer,wer,teds,table_teds")
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--min-p", type=float, default=None)
-    parser.add_argument("--repetition-penalty", type=float, default=1.0)
-    parser.add_argument("--presence-penalty", type=float, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=12384)
     return parser
 
 
@@ -72,12 +71,6 @@ def main() -> None:
     )
     settings = GenerationSettings(
         max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        min_p=args.min_p,
-        repetition_penalty=args.repetition_penalty,
-        presence_penalty=args.presence_penalty,
     )
 
     rows: list[dict[str, Any]] = []
@@ -155,23 +148,16 @@ def _load_samples(args: argparse.Namespace) -> list[ChandraSample]:
         raise ValueError("Provide exactly one input source: --dataset, --image, --pdf, or --pkl-dir.")
 
     if args.pkl_dir:
-        from chandra_baseline.chandra_evaluate_cer_wer_teds import load_eval_samples, load_split_page_keys, _extract_gt_text
-        page_keys = load_split_page_keys(args.manifest, args.split)
-        eval_samples = load_eval_samples(args.pkl_dir, page_keys)
-        samples = []
-        for s in eval_samples:
-            user_content = s["messages"][0]["content"]
-            image = None
-            prompt = ""
-            for block in user_content:
-                if block["type"] == "image":
-                    image = block["image"]
-                elif block["type"] == "text":
-                    prompt = block["text"]
-            reference = _extract_gt_text(s["messages"])
-            from chandra_finetune.data import ChandraSample
-            samples.append(ChandraSample(messages=s["messages"], image=image, prompt=prompt, reference=reference))
-        return samples
+        if not args.manifest or not args.split:
+            raise ValueError("--pkl-dir requires both --manifest and --split.")
+        from split import build_split
+
+        with Path(args.manifest).open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        split_key = f"{args.split}_pages"
+        if split_key not in manifest:
+            raise ValueError(f"Manifest does not contain {split_key!r}.")
+        return build_split(manifest[split_key], Path(args.pkl_dir))
 
     if args.dataset:
         return load_chandra_dataset(args.dataset)

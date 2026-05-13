@@ -8,22 +8,22 @@ from . import DEFAULT_MODEL_NAME
 
 @dataclass
 class LoraSettings:
-    r: int = 16
+    r: int = 8
     lora_alpha: int = 16
-    lora_dropout: float = 0.0
+    lora_dropout: float = 0.05
     bias: str = "none"
     random_state: int = 3407
     use_rslora: bool = False
-    finetune_vision_layers: bool = True
+    finetune_vision_layers: bool = False
     finetune_language_layers: bool = True
     finetune_attention_modules: bool = True
-    finetune_mlp_modules: bool = True
+    finetune_mlp_modules: bool = False
 
 
 def load_model_and_tokenizer(
     *,
     model_name: str = DEFAULT_MODEL_NAME,
-    load_in_4bit: bool = True,
+    load_in_4bit: bool = False,
     use_gradient_checkpointing: str | bool | None = "unsloth",
 ) -> tuple[Any, Any]:
     FastVisionModel = _fast_vision_model()
@@ -39,7 +39,7 @@ def load_model_and_tokenizer(
 def load_training_model(
     *,
     model_name: str = DEFAULT_MODEL_NAME,
-    load_in_4bit: bool = True,
+    load_in_4bit: bool = False,
     use_gradient_checkpointing: str | bool | None = "unsloth",
     lora: LoraSettings | None = None,
 ) -> tuple[Any, Any]:
@@ -71,9 +71,10 @@ def load_inference_model(
     *,
     model_name: str = DEFAULT_MODEL_NAME,
     adapter: str | None = None,
-    load_in_4bit: bool = True,
+    load_in_4bit: bool = False,
 ) -> tuple[Any, Any]:
     load_name = adapter or model_name
+    print(f"Loading inference model from {load_name} with load_in_4bit={load_in_4bit}", flush=True)
     model, tokenizer = load_model_and_tokenizer(
         model_name=load_name,
         load_in_4bit=load_in_4bit,
@@ -103,4 +104,3 @@ def _fast_vision_model() -> Any:
             "listed in README_CHANDRA_FINETUNE.md."
         ) from exc
     return FastVisionModel
-
