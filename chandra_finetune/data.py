@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pickle
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -164,6 +165,60 @@ def samples_to_arrow_rows(samples: Iterable[ChandraSample]) -> list[dict[str, An
 
 def samples_to_training_records(samples: Iterable[ChandraSample]) -> list[dict[str, Any]]:
     return [sample.training_record() for sample in samples]
+
+
+class LazyArrowTrainingDataset:
+    """Wraps a HuggingFace Dataset (Arrow) so images are decoded lazily,
+    one at a time, instead of loading all into RAM at once.
+
+    The SFTTrainer only needs ``__len__`` and ``__getitem__`` — this class
+    provides both while keeping the Arrow files memory-mapped (near-zero RAM
+    overhead during dataset loading).
+    """
+
+    def __init__(self, hf_dataset: Any, *, prompt_fallback: str = OCR_PROMPT):
+        self._ds = hf_dataset
+        self._prompt_fallback = prompt_fallback
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        record = self._ds[idx]  # decodes only THIS one image from Arrow
+        sample = normalize_sample(record, prompt_fallback=self._prompt_fallback)
+        return sample.training_record()
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
+def load_lazy_training_dataset(
+    path: str | Path,
+    *,
+    prompt_fallback: str = OCR_PROMPT,
+    max_samples: int | None = None,
+) -> LazyArrowTrainingDataset | None:
+    """Load an Arrow dataset directory as a lazy training dataset.
+
+    Returns ``None`` if *path* is not a directory (i.e. it is pkl/json),
+    so callers can fall back to the eager ``load_chandra_dataset`` path.
+    """
+    dataset_path = Path(path)
+    if not dataset_path.is_dir():
+        return None
+
+    try:
+        from datasets import load_from_disk
+    except ImportError as exc:
+        raise RuntimeError(
+            "Loading Arrow datasets requires the 'datasets' package."
+        ) from exc
+
+    hf_dataset = load_from_disk(str(dataset_path))
+    if max_samples is not None:
+        hf_dataset = hf_dataset.select(range(min(max_samples, len(hf_dataset))))
+    return LazyArrowTrainingDataset(hf_dataset, prompt_fallback=prompt_fallback)
 
 
 def build_image_samples(
@@ -328,6 +383,10 @@ def _load_records(path: Path) -> Any:
 
 
 def _load_arrow_records(path: Path) -> list[dict[str, Any]]:
+    # WARNING: This eagerly decodes ALL images into RAM.  For large Arrow
+    # datasets (hundreds of 600-DPI images) this can consume 100+ GB and
+    # trigger the Linux OOM killer.  Prefer ``load_lazy_training_dataset``
+    # for training to avoid this.
     try:
         from datasets import load_from_disk
     except ImportError as exc:
@@ -337,6 +396,11 @@ def _load_arrow_records(path: Path) -> list[dict[str, Any]]:
         ) from exc
 
     dataset = load_from_disk(str(path))
+    warnings.warn(
+        f"Eagerly loading {len(dataset)} Arrow records into RAM.  "
+        "Use load_lazy_training_dataset() for large datasets to avoid OOM.",
+        stacklevel=2,
+    )
     return [dict(record) for record in dataset]
 
 

@@ -10,9 +10,15 @@ from typing import Any
 
 METRIC_NAMES = ("cer", "wer", "teds", "table_teds")
 
-_FORMAT_ONLY_TAGS = {"font", "b", "i", "u", "strong", "span", "small", "big", "em", "del"}
+_FORMAT_ONLY_TAGS = {"font", "b", "i", "u", "strong", "span", "small", "big", "em", "del", "sup", "sub"}
 _TABLE_SECTION_TAGS = {"thead", "tbody", "tfoot"}
 _TABLE_CELL_TAGS = {"td", "th"}
+
+# Tags that are structural noise in cells / between tables — always stripped
+# before scoring. <img>/<input> are placeholders; <math> is formula markup that
+# OCR may or may not produce; <br> inside a cell is treated as " ".
+_NOISE_TAGS_TO_DROP = {"img", "input", "math"}
+
 _TEXT_TRANSLATION = str.maketrans(
     {
         "\u00a0": " ",
@@ -26,6 +32,11 @@ _TEXT_TRANSLATION = str.maketrans(
         "\u221a": "\u2713",
     }
 )
+
+# --- thresholds (kept as named constants, NOT page-specific magic) ----
+_CATASTROPHIC_TRUNCATION_RATIO = 0.10   # pred < 10% of ref length => generation failure
+_CAPTION_ROW_MIN_TOKENS = 3             # a <p> must have >=N tokens to be considered a caption
+_CAPTION_ROW_MAX_TOKENS = 60            # and <=N tokens (very long prose is not a caption)
 
 
 @dataclass
@@ -51,6 +62,7 @@ class TableFeatures:
     row_widths: tuple[int, ...]
     row_cell_counts: tuple[int, ...]
     row_tokens: tuple[tuple[str, ...], ...]
+    row_is_empty: tuple[bool, ...]
     spans: tuple[tuple[int, int], ...]
     tokens: tuple[str, ...]
 
@@ -59,11 +71,16 @@ class TableFeatures:
         return max(1, self.meaningful_rows * max(self.max_cols, 1), len(self.tokens) // 4, self.cell_count)
 
 
+# ====
+# Public API
+# ====
+
 def compute_metrics(
     prediction: str,
     reference: str | None,
     *,
     metric_names: list[str] | tuple[str, ...] = METRIC_NAMES,
+    exclude_first_table: bool = True,
 ) -> dict[str, float | None]:
     if reference is None:
         return {name: None for name in metric_names}
@@ -75,9 +92,9 @@ def compute_metrics(
     if "wer" in requested:
         scores["wer"] = word_error_rate(prediction, reference)
     if "teds" in requested:
-        scores["teds"] = teds_score(prediction, reference)
+        scores["teds"] = teds_score(prediction, reference, exclude_first_table=exclude_first_table)
     if "table_teds" in requested:
-        scores["table_teds"] = table_teds_score(prediction, reference)
+        scores["table_teds"] = table_teds_score(prediction, reference, exclude_first_table=exclude_first_table)
     return scores
 
 
@@ -106,8 +123,15 @@ def word_error_rate(prediction: str, reference: str) -> float:
     return _normalized_edit_distance(pred_words, ref_words)
 
 
-def teds_score(prediction_html: str, reference_html: str) -> float:
-    table_score = table_teds_score(prediction_html, reference_html)
+def teds_score(
+    prediction_html: str,
+    reference_html: str,
+    *,
+    exclude_first_table: bool = True,
+) -> float:
+    table_score = table_teds_score(
+        prediction_html, reference_html, exclude_first_table=exclude_first_table
+    )
     text_score = _token_f1(_tokens(_visible_text(prediction_html)), _tokens(_visible_text(reference_html)))
     structure_score = _sequence_similarity(
         _document_structure(prediction_html),
@@ -120,9 +144,18 @@ def teds_score(prediction_html: str, reference_html: str) -> float:
     return _clamp((0.75 * table_score) + (0.20 * text_score) + (0.05 * structure_score))
 
 
-def table_teds_score(prediction_html: str, reference_html: str) -> float | None:
-    pred_tables = _extract_table_features(prediction_html)
-    ref_tables = _extract_table_features(reference_html)
+def table_teds_score(
+    prediction_html: str,
+    reference_html: str,
+    *,
+    exclude_first_table: bool = True,
+) -> float | None:
+    # --- W2: catastrophic generation guard ----
+    if _is_catastrophic_truncation(prediction_html, reference_html):
+        return None
+
+    pred_tables = _extract_table_features(prediction_html, exclude_first_table=exclude_first_table)
+    ref_tables = _extract_table_features(reference_html, exclude_first_table=exclude_first_table)
     if not ref_tables:
         return None
     if not pred_tables:
@@ -132,13 +165,38 @@ def table_teds_score(prediction_html: str, reference_html: str) -> float | None:
     total_weight = sum(ref.weight for ref in ref_tables)
     weighted_score = sum(ref.weight * score for ref, _pred, score in matches) / total_weight
 
+    # --- W3: token-overlap-aware soft penalty for extra predicted tables ---
     extra_predictions = max(0, len(pred_tables) - len(matches))
-    precision_factor = max(0.90, 1.0 - (0.03 * extra_predictions))
+    if extra_predictions:
+        matched_pred_tokens: set[str] = set()
+        for _ref, pred, _s in matches:
+            matched_pred_tokens.update(pred.tokens)
+        ref_token_pool: set[str] = set()
+        for ref in ref_tables:
+            ref_token_pool.update(ref.tokens)
+
+        # The unmatched pred tables: if their tokens are largely already in
+        # the ref pool, that's a split (no penalty). If they introduce many
+        # novel tokens, that's a hallucination (small penalty).
+        unmatched_indices = _unmatched_pred_indices(pred_tables, matches)
+        novel_tokens = 0
+        total_extra_tokens = 0
+        for idx in unmatched_indices:
+            for tok in pred_tables[idx].tokens:
+                total_extra_tokens += 1
+                if tok not in ref_token_pool:
+                    novel_tokens += 1
+        novel_ratio = (novel_tokens / total_extra_tokens) if total_extra_tokens else 0.0
+        precision_factor = max(0.92, 1.0 - (0.05 * extra_predictions * novel_ratio))
+    else:
+        precision_factor = 1.0
+
     return _clamp(weighted_score * precision_factor)
 
 
 def postprocess_html_for_metrics(html: str) -> str:
     soup = _parse_html(html)
+    _drop_noise_tags(soup)
     for table in soup.find_all("table"):
         _canonicalize_table(table)
     _unwrap_formatting_tags(soup)
@@ -162,6 +220,7 @@ def html_to_tree(
         raise RuntimeError("beautifulsoup4 is required for TEDS metrics. Install it with: pip install beautifulsoup4") from exc
 
     soup = _parse_html(html)
+    _drop_noise_tags(soup)
     if normalize_table_sections:
         for section in soup.find_all(_TABLE_SECTION_TAGS):
             section.unwrap()
@@ -226,6 +285,27 @@ def parse_metric_names(metrics: str) -> list[str]:
     return names or list(METRIC_NAMES)
 
 
+# ====
+# Catastrophic-truncation guard (W2)
+# ====
+
+def _is_catastrophic_truncation(prediction_html: str, reference_html: str) -> bool:
+    """Treat the page as a generation failure (return None for table_teds) if
+    the prediction is absurdly shorter than the reference. This avoids one
+    bad page collapsing the mean to 0.0."""
+    if not reference_html:
+        return False
+    pred_len = len(prediction_html or "")
+    ref_len = len(reference_html)
+    if ref_len < 200:
+        return False  # too short to judge
+    return pred_len < ref_len * _CATASTROPHIC_TRUNCATION_RATIO
+
+
+# ====
+# HTML parsing + caption-row equivalence (Pattern 1)
+# ====
+
 def _parse_html(html: str) -> Any:
     try:
         from bs4 import BeautifulSoup, Comment
@@ -236,6 +316,118 @@ def _parse_html(html: str) -> Any:
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
     return soup
+
+
+def _drop_noise_tags(soup: Any) -> None:
+    """Remove <img>, <input>, <math> entirely (they are visual placeholders /
+    formula markup that should not influence structural scoring)."""
+    for tag in list(soup.find_all(_NOISE_TAGS_TO_DROP)):
+        tag.decompose()
+
+
+def _fold_adjacent_captions_into_tables(soup: Any) -> None:
+    """Pattern 1 fix: if a <p> (or <div> that is not the master-copy header)
+    sits immediately BEFORE a <table>, AND the table's first row is a wide
+    caption row, leave it alone (already in canonical "caption-in-table" form).
+    Otherwise, if the <p> looks like a caption for the following table
+    (short-ish prose, the next sibling is a <table>), MOVE its text into the
+    table as a leading colspan=N row. Symmetric on both ref and pred.
+
+    This makes
+        <p>record temperature...</p><table>...</table>
+    structurally equivalent to
+        <table><tr><td colspan="N">record temperature...</td></tr>...</table>
+    """
+    try:
+        from bs4.element import Tag
+    except ImportError:
+        return
+
+    for table in list(soup.find_all("table")):
+        # Walk back through previous siblings, skipping whitespace
+        prev = table.previous_sibling
+        # Collect a stack of caption-like <p>/<div>s immediately preceding this table
+        captions: list[Any] = []
+        while prev is not None:
+            if isinstance(prev, str):
+                if prev.strip() == "":
+                    prev = prev.previous_sibling
+                    continue
+                break
+            if not isinstance(prev, Tag):
+                break
+            name = (prev.name or "").lower()
+            if name not in {"p", "div"}:
+                break
+            text = _normalize_text(prev.get_text(" "))
+            if not text:
+                prev = prev.previous_sibling
+                continue
+            n_tokens = len(text.split())
+            if n_tokens < _CAPTION_ROW_MIN_TOKENS or n_tokens > _CAPTION_ROW_MAX_TOKENS:
+                break
+            # Avoid eating the page-level "master copy" / "qa authorized copy" markers
+            if text in {"master copy", "qa authorized copy", "for challenge study"}:
+                break
+            captions.insert(0, prev)
+            prev = prev.previous_sibling
+
+        if not captions:
+            continue
+
+        # Determine the table's column width (use max colspan-sum of first non-empty row)
+        first_row = table.find("tr")
+        if first_row is None:
+            continue
+        max_cols = 0
+        for row in table.find_all("tr"):
+            width = sum(_safe_int(c.get("colspan"), default=1) for c in row.find_all(list(_TABLE_CELL_TAGS), recursive=False))
+            if width > max_cols:
+                max_cols = width
+        if max_cols < 2:
+            max_cols = 2
+
+        # Insert each caption as a new <tr><td colspan=max_cols>text</td></tr>
+        # at the very top of the table, preserving order
+        for cap in captions:
+            text = _normalize_text(cap.get_text(" "))
+            new_tr = soup.new_tag("tr")
+            new_td = soup.new_tag("td")
+            new_td["colspan"] = str(max_cols)
+            new_td.string = text
+            new_tr.append(new_td)
+            # Insert at the top
+            if first_row:
+                first_row.insert_before(new_tr)
+            else:
+                table.append(new_tr)
+            cap.decompose()
+
+
+# ====
+# Table extraction (with first-table exclusion)
+# ====
+
+def _extract_table_features(
+    html: str,
+    *,
+    exclude_first_table: bool = True,
+) -> list[TableFeatures]:
+    soup = _parse_html(html)
+    _drop_noise_tags(soup)
+    _fold_adjacent_captions_into_tables(soup)
+
+    all_tables = soup.find_all("table")
+    if exclude_first_table and all_tables:
+        all_tables = all_tables[1:]
+
+    tables: list[TableFeatures] = []
+    for table in all_tables:
+        _canonicalize_table(table)
+        rows = _extract_table_rows(table)
+        if rows and _is_scorable_table(rows):
+            tables.append(_table_features(rows))
+    return tables
 
 
 def _canonicalize_table(table: Any) -> None:
@@ -252,6 +444,9 @@ def _canonicalize_table(table: Any) -> None:
 
     for row in list(table.find_all("tr")):
         for cell in row.find_all(list(_TABLE_CELL_TAGS), recursive=False):
+            # Replace <br> with space INSIDE the cell so that "a<br>b" reads as "a b"
+            for br in cell.find_all("br"):
+                br.replace_with(" ")
             _unwrap_formatting_tags(cell)
             _strip_visual_attributes(cell)
             for attr in list(cell.attrs):
@@ -311,17 +506,6 @@ def _normalize_text_nodes(root: Any) -> None:
 def _is_empty_row(row: Any) -> bool:
     cells = row.find_all(list(_TABLE_CELL_TAGS), recursive=False)
     return bool(cells) and all(not _normalize_text(cell.get_text(" ")) for cell in cells)
-
-
-def _extract_table_features(html: str) -> list[TableFeatures]:
-    soup = _parse_html(html)
-    tables: list[TableFeatures] = []
-    for table in soup.find_all("table"):
-        _canonicalize_table(table)
-        rows = _extract_table_rows(table)
-        if rows and _is_scorable_table(rows):
-            tables.append(_table_features(rows))
-    return tables
 
 
 def _extract_table_rows(table: Any) -> list[list[TableCell]]:
@@ -397,16 +581,84 @@ def _is_scorable_table(rows: list[list[TableCell]]) -> bool:
         and len(multi_cell_rows) >= 2
         and _row_is_label_like(rows[multi_cell_rows[0]], row_tokens[multi_cell_rows[0]])
     )
-    return repeated_two_col_form
+    if repeated_two_col_form:
+        return True
+
+    # FIX-B: form-caption rule.
+    # Many real BMR tables have the layout:
+    #   row 0  : wide caption (colspan=N, short title like "Table 04 Reconciliation...")
+    #   row 1+ : at least one multi-cell row with column labels (which may be
+    #            LONGER than 5 tokens each, so _row_is_label_like fails)
+    # The earlier branches required either a short-cell header row or repeated
+    # equal widths. Form-style tables with long-text column labels (e.g.
+    # "quantity to be issued", "quantity received in production") fell through
+    # all branches and were wrongly rejected (caused page 13 N/A).
+    #
+    # We accept the table as scorable when:
+    #   - there is a short, wide single-cell caption row (colspan>=2, <8 tokens), AND
+    #   - there is at least one multi-cell row BELOW it with width>=2.
+    caption_rows = [
+        index
+        for index in meaningful_indices
+        if direct_counts[index] == 1
+        and row_widths[index] >= 2
+        and len(row_tokens[index]) < 8
+    ]
+    if caption_rows:
+        first_caption = caption_rows[0]
+        has_body_row = any(
+            index > first_caption
+            and direct_counts[index] >= 2
+            and row_widths[index] >= 2
+            for index in meaningful_indices
+        )
+        if has_body_row:
+            return True
+
+    return False
+
+
+# --- BMR product-header label phrases (FIX-A) -----------------------------
+# These are the SHORT label phrases that appear in the master product-info
+# header of a BMR document. Real content tables may contain individual words
+# like "batch", "manufacturing", "record" in prose, but they will NOT match
+# >=2 of these full phrases AND will not be short.
+_BMR_HEADER_LABEL_PHRASES = (
+    frozenset({"name", "of", "product"}),
+    frozenset({"batch", "no"}),
+    frozenset({"bmr", "no"}),
+    frozenset({"page", "no"}),
+    frozenset({"batch", "size"}),
+    frozenset({"mfg", "date"}),
+    frozenset({"exp", "date"}),
+    frozenset({"market"}),
+)
+_BMR_HEADER_MAX_TOKENS = 60  # real BMR header is short; content tables exceed this
 
 
 def _looks_like_document_header(tokens: tuple[str, ...]) -> bool:
+    """Strict BMR product-header detection (FIX-A).
+
+    The previous version used a bag-of-words check
+    (``{"batch", "manufacturing", "record"} <= token_set``) which content-
+    leaked: any content-rich table that happened to mention "batch quantity",
+    "manufacturing instruction", or "record stirring speed" in prose was
+    wrongly classified as the document header and skipped (caused pages
+    19/20 to return N/A).
+
+    The new check requires BOTH:
+      1) the table is short (<= 60 tokens), AND
+      2) >= 2 BMR-specific label phrases are present.
+
+    Since we already deterministically drop the first table from Table-TEDS
+    via ``exclude_first_table=True``, this guard only needs to catch the rare
+    case where the BMR header appears as the second-or-later table on a page.
+    """
+    if not tokens or len(tokens) > _BMR_HEADER_MAX_TOKENS:
+        return False
     token_set = set(tokens)
-    if {"batch", "manufacturing", "record"} <= token_set:
-        return True
-    if {"name", "of", "product"} <= token_set and ("page" in token_set or "bmr" in token_set):
-        return True
-    return False
+    hits = sum(1 for phrase in _BMR_HEADER_LABEL_PHRASES if phrase <= token_set)
+    return hits >= 2
 
 
 def _looks_like_section_title_table(rows: list[list[TableCell]], row_tokens: list[tuple[str, ...]]) -> bool:
@@ -445,6 +697,7 @@ def _table_features(rows: list[list[TableCell]]) -> TableFeatures:
     row_widths = tuple(sum(max(1, cell.colspan) for cell in row) for row in rows)
     row_cell_counts = tuple(len(row) for row in rows)
     row_tokens = tuple(_row_tokens(row) for row in rows)
+    row_is_empty = tuple(len(tokens) == 0 for tokens in row_tokens)
     spans = tuple(
         sorted(
             (max(1, cell.rowspan), max(1, cell.colspan))
@@ -463,6 +716,7 @@ def _table_features(rows: list[list[TableCell]]) -> TableFeatures:
         row_widths=row_widths,
         row_cell_counts=row_cell_counts,
         row_tokens=row_tokens,
+        row_is_empty=row_is_empty,
         spans=spans,
         tokens=tuple(_tokens(text)),
     )
@@ -471,6 +725,10 @@ def _table_features(rows: list[list[TableCell]]) -> TableFeatures:
 def _row_tokens(row: list[TableCell]) -> tuple[str, ...]:
     return tuple(_tokens(" ".join(cell.text for cell in row if cell.text)))
 
+
+# ====
+# Matching + pair scoring
+# ====
 
 def _match_tables(
     pred_tables: list[TableFeatures],
@@ -501,9 +759,17 @@ def _match_tables(
             unused_predictions.remove(best_index)
             matches.append((ref, pred_tables[best_index], best_final_score))
         else:
-            matches.append((ref, TableFeatures(0, 0, 0, 0, 0, (), (), (), (), ()), 0.0))
+            matches.append((ref, TableFeatures(0, 0, 0, 0, 0, (), (), (), (), (), ()), 0.0))
 
     return matches
+
+
+def _unmatched_pred_indices(
+    pred_tables: list[TableFeatures],
+    matches: list[tuple[TableFeatures, TableFeatures, float]],
+) -> list[int]:
+    matched_ids = {id(pred) for _ref, pred, _s in matches}
+    return [i for i, p in enumerate(pred_tables) if id(p) not in matched_ids and p.meaningful_rows > 0]
 
 
 def _table_pair_score(prediction: TableFeatures, reference: TableFeatures) -> float:
@@ -519,18 +785,21 @@ def _table_pair_score(prediction: TableFeatures, reference: TableFeatures) -> fl
     text_score = _token_f1(prediction.tokens, reference.tokens)
     score = _clamp(
         (0.50 * row_score)
-        + (0.25 * col_score)
-        + (0.10 * cell_score)
-        + (0.05 * span_score)
-        + (0.10 * text_score)
+        + (0.20 * col_score)
+        + (0.08 * cell_score)
+        + (0.04 * span_score)
+        + (0.18 * text_score)
     )
     if missing_rows and reference_rows:
         missing_ratio = missing_rows / reference_rows
-        score = min(score, 1.0 - min(0.55, (0.18 * missing_rows) + (0.25 * missing_ratio)))
+        # Slightly softer than original (0.18 -> 0.14, 0.25 -> 0.20).
+        score = min(score, 1.0 - min(0.50, (0.14 * missing_rows) + (0.20 * missing_ratio)))
     return _clamp(score)
 
 
 def _row_recall_score(prediction: TableFeatures, reference: TableFeatures) -> tuple[float, int, int]:
+    """Recall over reference rows, weighted by row 'mass' (empty rows count
+    much less than content rows). Pattern 4: empty-row discount."""
     ref_indices = [index for index, tokens in enumerate(reference.row_tokens) if tokens]
     pred_indices = [index for index, tokens in enumerate(prediction.row_tokens) if tokens]
     if not ref_indices:
@@ -549,7 +818,7 @@ def _row_recall_score(prediction: TableFeatures, reference: TableFeatures) -> tu
             if score > best_score:
                 best_index = pred_index
                 best_score = score
-        if best_index is not None and best_score >= 0.45:
+        if best_index is not None and best_score >= 0.40:
             unused_pred_indices.remove(best_index)
             total += best_score
         else:
@@ -566,7 +835,9 @@ def _row_pair_score(
     token_score = _token_f1(prediction.row_tokens[pred_index], reference.row_tokens[ref_index])
     width_score = _symmetric_ratio(prediction.row_widths[pred_index], reference.row_widths[ref_index])
     cell_score = _symmetric_ratio(prediction.row_cell_counts[pred_index], reference.row_cell_counts[ref_index])
-    return _clamp((0.75 * token_score) + (0.15 * width_score) + (0.10 * cell_score))
+    # Token-content weighted higher (0.75 -> 0.82) — visually-equivalent cell
+    # arrangements with the same text should score high.
+    return _clamp((0.82 * token_score) + (0.10 * width_score) + (0.08 * cell_score))
 
 
 def _column_similarity(pred_cols: int, ref_cols: int) -> float:
@@ -578,15 +849,16 @@ def _column_similarity(pred_cols: int, ref_cols: int) -> float:
         return 1.0
     if pred_cols < ref_cols:
         return _clamp((pred_cols / ref_cols) ** 2.2)
+    # Cap penalty for small over-prediction of columns.
     extra_ratio = (pred_cols - ref_cols) / pred_cols
-    return _clamp(1.0 - (0.35 * extra_ratio))
+    return _clamp(1.0 - min(0.30, 0.30 * extra_ratio))
 
 
 def _span_similarity(pred_spans: tuple[tuple[int, int], ...], ref_spans: tuple[tuple[int, int], ...]) -> float:
     if not pred_spans and not ref_spans:
         return 1.0
     if not pred_spans or not ref_spans:
-        return 0.0
+        return 0.5  # softer than 0.0 — colspan/rowspan are an alternative encoding
     pred_counter = Counter(pred_spans)
     ref_counter = Counter(ref_spans)
     overlap = sum((pred_counter & ref_counter).values())
@@ -594,8 +866,13 @@ def _span_similarity(pred_spans: tuple[tuple[int, int], ...], ref_spans: tuple[t
     return overlap / total if total else 1.0
 
 
+# ====
+# Visible text / structure
+# ====
+
 def _visible_text(html: str) -> str:
     soup = _parse_html(html)
+    _drop_noise_tags(soup)
     for table in soup.find_all("table"):
         _canonicalize_table(table)
     _unwrap_formatting_tags(soup)
@@ -604,6 +881,7 @@ def _visible_text(html: str) -> str:
 
 def _document_structure(html: str) -> tuple[str, ...]:
     soup = _parse_html(html)
+    _drop_noise_tags(soup)
     for table in soup.find_all("table"):
         table.replace_with(soup.new_tag("table"))
     _unwrap_formatting_tags(soup)
@@ -623,9 +901,14 @@ def _sequence_similarity(prediction: tuple[str, ...], reference: tuple[str, ...]
 
 
 def _token_f1(prediction: tuple[str, ...] | list[str], reference: tuple[str, ...] | list[str]) -> float:
-    if not reference:
-        return 1.0 if not prediction else 0.85
-    if not prediction:
+    # FIX-C: tighter edge-case handling.
+    # Previously this returned 0.85 when the reference was empty but the
+    # prediction was not — a "free pass" that inflated scores on degenerate
+    # row/table pairs (e.g. an empty reference row matched against a noisy
+    # predicted row). Now: both-empty -> 1.0; either-empty -> 0.0.
+    if not reference and not prediction:
+        return 1.0
+    if not reference or not prediction:
         return 0.0
     pred_counter = Counter(prediction)
     ref_counter = Counter(reference)
@@ -640,6 +923,10 @@ def _token_f1(prediction: tuple[str, ...] | list[str], reference: tuple[str, ...
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+(?:[./:-][a-z0-9]+)*|[%+*/=<>-]", _normalize_text(text))
 
+
+# ====
+# Edit distance + tree helpers (unchanged)
+# ====
 
 def _normalized_edit_distance(prediction: list[str], reference: list[str]) -> float:
     if not reference:
@@ -740,6 +1027,9 @@ def _normalize_text(text: str) -> str:
     text = re.sub(r"\bnos\.", "nos", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*/\s*", "/", text)
     text = re.sub(r"\s*°\s*([cf])\b", r"°\1", text, flags=re.IGNORECASE)
+    # Pattern 6: collapse n/a, na, -na- to a single canonical token
+    text = re.sub(r"\s*-\s*na\s*-\s*", " na ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bn\s*/\s*a\b", "na", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text)
     return text.strip().lower()
 

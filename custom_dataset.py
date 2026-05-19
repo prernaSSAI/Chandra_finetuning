@@ -1,33 +1,43 @@
 import json
-import pickle
 import os
+import io
 from pathlib import Path
 from PIL import Image
-import fitz  
+import fitz
 from prompts import OCR_PROMPT
 
-PDF_PATH   = "/mnt/disk/ml_data/prerna/data/test.pdf"
-OCR_PATH   = "/mnt/disk/ml_data/prerna/json/test_5.json"
-OUTPUT_DIR = "/mnt/disk/ml_data/prerna/test_pkl"
-DPI        = 600 #600
+# ── Configure these for each of your 3 runs ──────────────────────────────────
+PDF_PATH    = "/mnt/disk/ml_data/prerna/chandra_pdf/chandra_AH25020.pdf"
+OCR_PATH    = "/mnt/disk/ml_data/prerna/annotated_json/AH250020_corrected.json"
+OUTPUT_DIR  = "/mnt/disk/ml_data/prerna/final_arrow/AH25020"   # change to new2, new3 for others
+DPI         = 600
 INSTRUCTION = OCR_PROMPT
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def pdf_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 400) -> Image.Image:
     """Convert a single PDF page (0-indexed) to a PIL Image."""
     page = doc[page_index]
-    mat  = fitz.Matrix(dpi / 72, dpi / 72)   # 72 is the base DPI for PDF
+    mat  = fitz.Matrix(dpi / 72, dpi / 72)
     pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-    img  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    return img
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
-def build_dataset():
-    # Load OCR JSON 
+def image_to_png_bytes(image: Image.Image) -> bytes:
+    """Convert PIL image to PNG bytes for Arrow storage."""
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def build_dataset_arrow():
+    from datasets import Dataset, Features, Image as DatasetImage, Value
+
+    # Load OCR JSON
     with open(OCR_PATH, "r", encoding="utf-8") as f:
         ocr_data = json.load(f)
 
-    # Build a lookup: page_number → markdown_page
+    # Build lookup: page_number → markdown
     page_to_markdown = {}
     for entry in ocr_data:
         page_num = entry.get("page")
@@ -37,26 +47,19 @@ def build_dataset():
 
     print(f"[INFO] Loaded OCR for {len(page_to_markdown)} pages: {sorted(page_to_markdown.keys())}")
 
-    # Open PDF ────────────────────────────────────────────────────────────
     doc = fitz.open(PDF_PATH)
     print(f"[INFO] PDF has {doc.page_count} pages")
 
-    #  Prepare output directory for saved images 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    images_dir = os.path.join(OUTPUT_DIR, "page_images")
-    os.makedirs(images_dir, exist_ok=True)
 
-    # Build dataset
-    dataset          = []   # list of dicts with PIL images  (for training)
-    dataset_json     = []   # list of dicts with image paths (for inspection)
-    skipped_pages    = []
+    arrow_rows   = []   # Arrow dataset rows (images as PNG bytes)
+    skipped_pages = []
 
-    # OCR pages are 1-indexed; PDF pages are 0-indexed
     for page_num, markdown_text in sorted(page_to_markdown.items()):
-        page_index = page_num - 1   # convert to 0-indexed
+        page_index = page_num - 1  # 0-indexed
 
         if page_index < 0 or page_index >= doc.page_count:
-            print(f"[WARN] Page {page_num} out of PDF range (PDF has {doc.page_count} pages). Skipping.")
+            print(f"[WARN] Page {page_num} out of PDF range. Skipping.")
             skipped_pages.append(page_num)
             continue
 
@@ -65,96 +68,51 @@ def build_dataset():
             skipped_pages.append(page_num)
             continue
 
-        # Convert PDF page → PIL image
-        pil_img = pdf_page_to_pil(doc, page_index, dpi=DPI)
+        # Render PDF page → PIL image → PNG bytes (no file written to disk)
+        pil_img   = pdf_page_to_pil(doc, page_index, dpi=DPI)
+        png_bytes = image_to_png_bytes(pil_img)
 
-        # Save image to disk (for JSON-serializable version)
-        img_filename = f"page_{page_num:03d}.png"
-        img_path     = os.path.join(images_dir, img_filename)
-        pil_img.save(img_path)
-
-        # Load the saved PNG back so type is PIL.PngImagePlugin.PngImageFile
-        
-        png_img = Image.open(img_path)
-        sample = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text",  "text": INSTRUCTION},
-                        {"type": "image", "image": png_img}     # PIL.PngImagePlugin.PngImageFile
-                    ]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": markdown_text}
-                    ]
-                }
-            ]
-        }
-        dataset.append(sample)
-
-        # JSON-serializable version (image stored as path string)
-        sample_json = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text",  "text": INSTRUCTION},
-                        {"type": "image", "image_path": img_path,
-                         "image_size": {"width": pil_img.width, "height": pil_img.height}}
-                    ]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": markdown_text}
-                    ]
-                }
-            ],
-            "metadata": {
-                "pdf_path":   PDF_PATH,
-                "ocr_path":   OCR_PATH,
+        arrow_rows.append({
+            "image":     {"bytes": png_bytes, "path": None},
+            "prompt":    INSTRUCTION,
+            "reference": markdown_text,
+            "metadata":  json.dumps({
+                "pdf_path":    PDF_PATH,
+                "ocr_path":    OCR_PATH,
                 "page_number": page_num,
-                "image_path": img_path
-            }
-        }
-        dataset_json.append(sample_json)
-        print(f"[OK]  Page {page_num:>3}  →  image saved to {img_path}")
+            }, ensure_ascii=False),
+        })
+
+        print(f"[OK]  Page {page_num:>3}  →  encoded to PNG bytes ({len(png_bytes):,} bytes)")
 
     doc.close()
 
-    # Save outputs
+    if not arrow_rows:
+        print("[ERROR] No samples were built. Check your PDF/OCR paths.")
+        return
 
-    # 1. JSON file (human readable / inspectable)
-    json_out = os.path.join(OUTPUT_DIR, "vlm_dataset.json")
-    with open(json_out, "w", encoding="utf-8") as f:
-        json.dump(dataset_json, f, indent=2, ensure_ascii=False)
-    print(f"\n[SAVED] JSON dataset  → {json_out}")
+    # Save Arrow dataset directly — no pkl, no intermediate files
+    features = Features({
+        "image":     DatasetImage(),
+        "prompt":    Value("string"),
+        "reference": Value("string"),
+        "metadata":  Value("string"),
+    })
+    dataset = Dataset.from_list(arrow_rows, features=features)
+    dataset.save_to_disk(OUTPUT_DIR)
 
-    # 2. Pickle file (contains actual PIL Images — ready for training)
-    pkl_out = os.path.join(OUTPUT_DIR, "vlm_dataset.pkl")
-    with open(pkl_out, "wb") as f:
-        pickle.dump(dataset, f)
-    print(f"[SAVED] Pickle dataset → {pkl_out}")
-
-    # Summary 
     print(f"\n{'='*50}")
     print(f"  Dataset Summary")
     print(f"{'='*50}")
-    print(f"  Total samples generated : {len(dataset)}")
+    print(f"  Total samples saved     : {len(dataset)}")
     print(f"  Skipped pages           : {skipped_pages if skipped_pages else 'None'}")
-    print(f"  Page images saved to    : {images_dir}")
-    print(f"  JSON output             : {json_out}")
-    print(f"  Pickle output           : {pkl_out}")
+    print(f"  Arrow output            : {OUTPUT_DIR}")
     print(f"{'='*50}")
-    return dataset
 
 
 if __name__ == "__main__":
-    dataset = build_dataset() or []
-    print(f"\n[DONE] Dataset ready with {len(dataset)} samples.")
-    print("Load the pickle file in your training notebook like:")
-    print("  import pickle")
-    print("  dataset = pickle.load(open('vlm_dataset_output/vlm_dataset.pkl', 'rb'))")
+    build_dataset_arrow()
+    print("\n[DONE] Arrow dataset ready.")
+    print("To load it later:")
+    print(f"  from datasets import load_from_disk")
+    print(f"  ds = load_from_disk('{OUTPUT_DIR}')")

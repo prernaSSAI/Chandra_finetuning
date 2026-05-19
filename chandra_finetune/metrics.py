@@ -14,11 +14,14 @@ from chandra_finetune.metrics_less_penalizing import (
     word_error_rate,
 )
 
+clean_html = postprocess_html_for_metrics
+
 __all__ = [
     "METRIC_NAMES",
     "HtmlNode",
     "aggregate_metrics",
     "character_error_rate",
+    "clean_html",
     "compute_metrics",
     "html_to_tree",
     "parse_metric_names",
