@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from chandra_finetune.metrics_less_penalizing import (
+from chandra_finetune.metrics_relaxed import (
     METRIC_NAMES,
     HtmlNode,
     aggregate_metrics,

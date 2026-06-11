@@ -8,10 +8,10 @@ from PIL import Image
 
 @dataclass
 class GenerationSettings:
-    max_new_tokens: int = 4096
+    max_new_tokens: int = 12384
     temperature: float = 0.0
-    top_p: float = 0.8
-    top_k: int = 20
+    top_p: float = 1.0
+    top_k: int = 0
     min_p: float | None = None
     repetition_penalty: float = 1.0
     presence_penalty: float | None = None
@@ -34,6 +34,7 @@ def generate_text(
     """Generate OCR HTML/markdown for one image."""
 
     settings = settings or GenerationSettings()
+    _disable_tokenizer_truncation(tokenizer)
     messages = [
         {
             "role": "user",
@@ -48,6 +49,7 @@ def generate_text(
         image,
         input_text,
         add_special_tokens=False,
+        truncation=False,
         return_tensors="pt",
     )
 
@@ -101,3 +103,22 @@ def _resolve_device(model: Any, device: str) -> str | None:
         return None
     return device
 
+
+def _disable_tokenizer_truncation(tokenizer: Any) -> None:
+    """Prevent saved training-time 2048-token truncation from cutting image tokens."""
+
+    for candidate in (tokenizer, getattr(tokenizer, "tokenizer", None)):
+        if candidate is None:
+            continue
+        try:
+            candidate.model_max_length = max(int(getattr(candidate, "model_max_length", 0)), 262144)
+        except Exception:
+            pass
+
+        backend = getattr(candidate, "_tokenizer", None)
+        if backend is None:
+            continue
+        try:
+            backend.no_truncation()
+        except Exception:
+            pass

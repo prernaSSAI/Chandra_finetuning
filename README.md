@@ -124,15 +124,20 @@ Run LoRA training on the Arrow train split:
 ```bash
 python train_chandra.py \
   --dataset data/chandra_splits/train \
-  --eval-dataset data/chandra_splits/test \
   --model-name datalab-to/chandra \
   --output-dir outputs/chandra_lora \
-  --max-steps 30
+  --num-train-epochs 25 \
+  --early-stopping-patience 5
 ```
 
 The training script loads Arrow directories, `.pkl`, `.json`, or `.jsonl`
 datasets, normalizes records into PIL-backed Unsloth messages, applies LoRA
 with the notebook defaults, and saves the adapter plus tokenizer.
+When `--eval-dataset` is omitted, evaluation is forced off and
+`--early-stopping-patience` watches logged training loss instead of validation
+loss. Patience is counted in epochs, using the average logged train loss for
+each epoch. The best epoch train-loss adapter is saved to `--output-dir/best`,
+and the model from the final training step is saved to `--output-dir/last`.
 
 For new runs, prefer Arrow directories:
 
@@ -141,7 +146,80 @@ data/chandra_splits/train
 data/chandra_splits/test
 ```
 
-Use `--max-steps -1 --num-train-epochs 1` for epoch-based training.
+`--max-steps` defaults to `-1`, so `--num-train-epochs` controls full-epoch
+training unless you explicitly set a step cap.
+
+### Fold valid plus new OCR/PDF pages into train
+
+If you already have `train.pkl`, `valid.pkl`, and `test.pkl`, and you want the
+final dataset to have only train/test splits, use `merge_chandra_splits.py`.
+It folds `valid.pkl` into train, converts new PDF/OCR JSON page annotations
+into train samples, keeps test separate, and can also export split-specific
+PDFs.
+
+```bash
+python merge_chandra_splits.py \
+  --train-input /path/to/train.pkl \
+  --valid-input /path/to/valid.pkl \
+  --test-input /path/to/test.pkl \
+  --new-pdf-ocr /path/to/new.pdf /path/to/ocr.json \
+  --output-dir data/chandra_final_splits \
+  --format pickle \
+  --overwrite
+```
+
+Repeat `--new-pdf-ocr PDF OCR_JSON` for multiple new PDFs. The script writes:
+
+```text
+data/chandra_final_splits/
+  train.pkl
+  test.pkl
+  new_data.pkl
+  train_pages.pdf
+  test_pages.pdf
+  split_manifest.json
+```
+
+`train_pages.pdf` and `test_pages.pdf` are created automatically unless you
+pass `--no-export-pdfs`. When a sample has `metadata.pdf_path` and
+`metadata.page_number`, the script copies the original PDF page. For older
+pickles without that metadata, it writes the image stored in the pickle as a
+PDF page instead.
+
+If you already converted your new OCR/PDF files with `custom_dataset.py`, pass
+those new `.pkl` files as extra train inputs:
+
+```bash
+python merge_chandra_splits.py \
+  --train-input /path/to/existing/train.pkl \
+  --train-input /path/to/new_pkls/*/vlm_dataset.pkl /path/to/extra_35_samples.pkl \
+  --test-input /path/to/existing/test.pkl \
+  --output-dir data/chandra_final_splits \
+  --format pickle \
+  --overwrite
+```
+
+You can also pass a directory that contains only the new pickle files:
+
+```bash
+python merge_chandra_splits.py \
+  --train-input /path/to/existing/train.pkl \
+  --train-input /path/to/new_pkls_dir \
+  --train-input /path/to/extra_35_samples.pkl \
+  --test-input /path/to/existing/test.pkl \
+  --output-dir data/chandra_final_splits \
+  --format pickle \
+  --overwrite
+```
+
+To create each new pickle with metadata:
+
+```bash
+python custom_dataset.py \
+  --pdf /path/to/source.pdf \
+  --ocr-json /path/to/ocr.json \
+  --output-dir /path/to/new_pkls/doc_001
+```
 
 The training flow should:
 
@@ -181,7 +259,7 @@ Both inference paths should use the same Arrow test split when comparing results
 python infer_chandra.py \
   --dataset data/chandra_splits/test \
   --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora \
+  --adapter outputs/chandra_lora/best \
   --output predictions.jsonl \
   --metrics cer,wer,teds,table_teds
 ```
@@ -216,7 +294,7 @@ the vLLM output on the same test split.
 python inf_vllm.py \
   --dataset data/chandra_splits/test \
   --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora \
+  --adapter outputs/chandra_lora/best \
   --output vllm_predictions.csv \
   --metrics cer,wer,teds,table_teds
 ```
@@ -231,7 +309,7 @@ Recommended comparison flow:
 python infer_chandra.py \
   --dataset data/chandra_splits/test \
   --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora \
+  --adapter outputs/chandra_lora/best \
   --output normal_predictions.jsonl \
   --metrics cer,wer,teds,table_teds
 
@@ -239,7 +317,7 @@ python infer_chandra.py \
 python inf_vllm.py \
   --dataset data/chandra_splits/test \
   --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora \
+  --adapter outputs/chandra_lora/best \
   --output vllm_predictions.csv \
   --metrics cer,wer,teds,table_teds
 ```

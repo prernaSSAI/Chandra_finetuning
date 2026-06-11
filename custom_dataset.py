@@ -2,32 +2,24 @@ import json
 import os
 import io
 from pathlib import Path
-from PIL import Image
 import fitz
 from prompts import OCR_PROMPT
 
-# ── Configure these for each of your 3 runs ──────────────────────────────────
+
 PDF_PATH    = "/mnt/disk/ml_data/prerna/chandra_pdf/chandra_AH25020.pdf"
 OCR_PATH    = "/mnt/disk/ml_data/prerna/annotated_json/AH250020_corrected.json"
-OUTPUT_DIR  = "/mnt/disk/ml_data/prerna/final_arrow/AH25020"   # change to new2, new3 for others
+OUTPUT_DIR  = "/mnt/disk/ml_data/prerna/final_arrow/AH25020"  
 DPI         = 600
 INSTRUCTION = OCR_PROMPT
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-def pdf_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 400) -> Image.Image:
-    """Convert a single PDF page (0-indexed) to a PIL Image."""
+
+def pdf_page_to_png_bytes(doc: fitz.Document, page_index: int, dpi: int = 600) -> bytes:
+    """Render a single PDF page directly to PNG bytes for Arrow storage."""
     page = doc[page_index]
-    mat  = fitz.Matrix(dpi / 72, dpi / 72)
-    pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-
-def image_to_png_bytes(image: Image.Image) -> bytes:
-    """Convert PIL image to PNG bytes for Arrow storage."""
-    buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, format="PNG")
-    return buffer.getvalue()
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+    return pix.tobytes("png")
 
 
 def build_dataset_arrow():
@@ -69,8 +61,7 @@ def build_dataset_arrow():
             continue
 
         # Render PDF page → PIL image → PNG bytes (no file written to disk)
-        pil_img   = pdf_page_to_pil(doc, page_index, dpi=DPI)
-        png_bytes = image_to_png_bytes(pil_img)
+        png_bytes = pdf_page_to_png_bytes(doc, page_index, dpi=DPI)
 
         arrow_rows.append({
             "image":     {"bytes": png_bytes, "path": None},
@@ -91,7 +82,7 @@ def build_dataset_arrow():
         print("[ERROR] No samples were built. Check your PDF/OCR paths.")
         return
 
-    # Save Arrow dataset directly — no pkl, no intermediate files
+    # Save Arrow dataset directly 
     features = Features({
         "image":     DatasetImage(),
         "prompt":    Value("string"),
