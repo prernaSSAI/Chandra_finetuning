@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import base64
 import io
 import json
@@ -11,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -148,69 +148,60 @@ def wait_for_vllm(vllm_url: str, model: str, timeout: int = 120) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Configuration
 # ---------------------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run Chandra inference via vLLM and compute OCR metrics."
-    )
-    # --- Input sources (unchanged from original) ---
-    parser.add_argument("--dataset", help="Path to dataset artifact: Arrow dir, .pkl, .json, or .jsonl.")
-    parser.add_argument("--image", action="append", default=[], help="Image path. Can be repeated.")
-    parser.add_argument("--pdf", help="PDF path to render and process.")
-    parser.add_argument("--references-json", help="Optional page reference JSON for --pdf inputs.")
-    parser.add_argument("--reference-field", default="markdown",
-                        help="Reference text field in --references-json.")
-    parser.add_argument("--page-range", help='PDF pages, e.g. "1-5,7,9".')
-    parser.add_argument("--dpi", type=int, default=300, help="PDF render DPI.")
-    parser.add_argument("--prompt-type", default="ocr", choices=sorted(PROMPT_MAPPING),
-                        help="Prompt for image/PDF inputs.")
-    parser.add_argument("--override-prompt", help="Force this prompt for every sample.")
+@dataclass
+class InferenceConfig:
+    """All inference settings — edit these values directly in code.
 
-    parser.add_argument("--pkl-dir", help="Directory with source .pkl files.")
-    parser.add_argument("--manifest", help="Split manifest JSON.")
-    parser.add_argument("--split", choices=["train", "valid", "test"],
-                        help="Split to use with --pkl-dir.")
+    These were previously command-line flags. They now live here so a run is
+    fully reproducible from this file and there are no CLI args to remember.
+    To start a run, edit the values below and run:  python inf_vllm.py
 
-    # --- vLLM client ---
-    parser.add_argument("--vllm-url", default="http://localhost:8000",
-                        help="Base URL of the vLLM OpenAI-compatible server "
-                             "(default: http://localhost:8000).")
-    parser.add_argument("--vllm-model", default="chandra_lora",
-                        help="Model name as registered in vLLM --lora-modules "
-                             "(default: chandra_lora).")
-    parser.add_argument("--no-wait", action="store_true",
-                        help="Skip the startup health-check and go straight to inference.")
-    parser.add_argument("--wait-timeout", type=int, default=120,
-                        help="Seconds to wait for the vLLM server to become ready (default: 120).")
-    parser.add_argument("--request-timeout", type=int, default=300,
-                        help="Per-request HTTP timeout in seconds (default: 300).")
-    parser.add_argument("--retry-attempts", type=int, default=3,
-                        help="Retry count per sample on transient network errors (default: 3).")
-    parser.add_argument("--retry-delay", type=float, default=5.0,
-                        help="Seconds between retries (default: 5).")
-    parser.add_argument("--concurrency", type=int, default=1,
-                        help="Number of pages to process in parallel (default: 1 = sequential). "
-                             "Set to 4-8 for concurrent inference with vLLM continuous batching.")
+    Provide exactly ONE input source: ``dataset``, ``image``, ``pdf``, or
+    ``pkl_dir`` (the latter also needs ``manifest`` + ``split``).
+    """
 
-    # --- Legacy flags (accepted but ignored so existing scripts don't break) ---
-    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME,
-                        help="[IGNORED] Legacy: base model checkpoint.")
-    parser.add_argument("--adapter",
-                        help="[IGNORED] Legacy: LoRA adapter path (now set server-side).")
-    parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=False,
-                        help="[IGNORED] Legacy: 4-bit quantisation flag.")
-    parser.add_argument("--device", default="auto",
-                        help="[IGNORED] Legacy: device selection.")
+    # ── Input sources (provide exactly one) ─────────────────────────────────
+    # Path to dataset artifact: Arrow dir, .pkl, .json, or .jsonl.
+    dataset: str | None = None
+    # Image path(s). Add one or more entries, e.g. ["a.png", "b.png"].
+    image: list[str] = field(default_factory=list)
+    pdf: str | None = None                       # PDF path to render and process
+    references_json: str | None = None           # optional page reference JSON for pdf inputs
+    reference_field: str = "markdown"            # reference text field in references_json
+    page_range: str | None = None                # PDF pages, e.g. "1-5,7,9"
+    dpi: int = 300                               # PDF render DPI
+    prompt_type: str = "ocr"                     # prompt for image/PDF inputs (key in PROMPT_MAPPING)
+    override_prompt: str | None = None           # force this prompt for every sample
 
-    # --- Generation settings ---
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--output", default="predictions.json",
-                        help="JSON output path. Must end with .json.")
-    parser.add_argument("--metrics", default="cer,wer,teds,table_teds")
-    parser.add_argument("--max-new-tokens", type=int, default=12384)
-    return parser
+    pkl_dir: str | None = None                   # directory with source .pkl files
+    manifest: str | None = None                  # split manifest JSON
+    split: str | None = None                     # "train" | "valid" | "test" (with pkl_dir)
+
+    # ── vLLM client ─────────────────────────────────────────────────────────
+    # Base URL of the vLLM OpenAI-compatible server.
+    vllm_url: str = "http://localhost:8000"
+    # Model name as registered in vLLM --lora-modules.
+    vllm_model: str = "chandra_lora"
+    no_wait: bool = False                        # skip startup health-check
+    wait_timeout: int = 120                      # seconds to wait for the server to become ready
+    request_timeout: int = 300                   # per-request HTTP timeout in seconds
+    retry_attempts: int = 3                      # retries per sample on transient network errors
+    retry_delay: float = 5.0                     # seconds between retries
+    # Pages to process in parallel (1 = sequential). Set 4-8 for concurrent
+    # inference with vLLM continuous batching.
+    concurrency: int = 1
+
+    # ── Model (base checkpoint, for reference/metadata only) ────────────────
+    model_name: str = DEFAULT_MODEL_NAME
+
+    # ── Generation / output ─────────────────────────────────────────────────
+    max_samples: int | None = None               # cap number of samples (debugging)
+    output: str = "predictions.json"             # JSON output path; must end with .json
+    metrics: str = "cer,wer,teds,table_teds"     # comma-separated metric names
+    max_new_tokens: int = 12384
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +212,7 @@ def _process_one_page(
     *,
     index: int,
     sample: ChandraSample,
-    args: argparse.Namespace,
+    args: InferenceConfig,
     metric_names: list[str],
 ) -> dict[str, Any]:
     """Run inference + metrics for a single page. Returns the result row dict.
@@ -276,16 +267,7 @@ def _process_one_page(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = build_parser().parse_args()
-
-    # Warn about ignored legacy flags.
-    if args.adapter:
-        print(
-            f"[INFO] --adapterargs={args.adapter!r} is ignored when using vLLM. "
-            "The LoRA adapter is loaded by the server via --lora-modules."
-        )
-    if args.load_in_4bit:
-        print("[INFO] --load-in-4bit is ignored when using vLLM.")
+    args = InferenceConfig()
 
     metric_names = parse_metric_names(args.metrics)
     samples = _load_samples(args)
@@ -364,7 +346,7 @@ def main() -> None:
 
 def _run_sequential(
     pending: list[tuple[int, ChandraSample]],
-    args: argparse.Namespace,
+    args: InferenceConfig,
     metric_names: list[str],
     rows: list[dict[str, Any]],
     output_path: Path,
@@ -387,7 +369,7 @@ def _run_sequential(
 
 def _run_concurrent(
     pending: list[tuple[int, ChandraSample]],
-    args: argparse.Namespace,
+    args: InferenceConfig,
     metric_names: list[str],
     rows: list[dict[str, Any]],
     output_path: Path,
@@ -457,7 +439,7 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
 # Sample loading (unchanged from original infer_chandra.py)
 # ---------------------------------------------------------------------------
 
-def _load_samples(args: argparse.Namespace) -> list[ChandraSample]:
+def _load_samples(args: InferenceConfig) -> list[ChandraSample]:
     sources = (
         int(bool(args.dataset))
         + int(bool(args.image))

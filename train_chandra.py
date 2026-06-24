@@ -233,25 +233,25 @@ def main() -> None:
     elif best_table_teds_dir.exists() and args.resume_from_checkpoint is not None:
         print(f"Resuming: preserving existing best Table-TEDS adapter at {best_table_teds_dir}")
     table_teds_monitor = _build_table_teds_monitor_callback(
-    TrainerCallback,
-    tokenizer=tokenizer,
-    eval_samples=eval_samples_for_teds,
-    best_model_dir=best_table_teds_dir,
-    patience=args.early_stopping_patience,
-    threshold=args.early_stopping_threshold,
-    min_steps=args.early_stopping_min_steps,
-    generation_settings=GenerationSettings(
-        max_new_tokens=args.eval_generation_max_new_tokens,
-        temperature=args.eval_generation_temperature,
-        top_p=args.eval_generation_top_p,
-        top_k=args.eval_generation_top_k,
-        repetition_penalty=args.eval_generation_repetition_penalty,
-    ),
-    exclude_first_table=args.table_teds_exclude_first_table,
-    initial_best_score=args.resume_best_table_teds,
-    initial_best_epoch=args.resume_best_epoch,
-    initial_best_step=args.resume_best_step,
-)
+        TrainerCallback,
+        tokenizer=tokenizer,
+        eval_samples=eval_samples_for_teds,
+        best_model_dir=best_table_teds_dir,
+        patience=args.early_stopping_patience,
+        threshold=args.early_stopping_threshold,
+        min_steps=args.early_stopping_min_steps,
+        generation_settings=GenerationSettings(
+            max_new_tokens=args.eval_generation_max_new_tokens,
+            temperature=args.eval_generation_temperature,
+            top_p=args.eval_generation_top_p,
+            top_k=args.eval_generation_top_k,
+            repetition_penalty=args.eval_generation_repetition_penalty,
+        ),
+        exclude_first_table=args.table_teds_exclude_first_table,
+        initial_best_score=args.resume_best_table_teds,
+        initial_best_epoch=args.resume_best_epoch,
+        initial_best_step=args.resume_best_step,
+    )
 
     trainer = SFTTrainer(
         model=model,
