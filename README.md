@@ -1,42 +1,183 @@
-# Chandra Unsloth Fine-Tuning
+# Chandra Fine-Tuning
 
-This directory contains reusable scripts for LoRA fine-tuning and evaluation of
-`datalab-to/chandra` using the dataset shape produced by `custom_dataset.py`.
+## Repository Layout
 
-The current workflow uses Arrow / Hugging Face Dataset artifacts as the primary
-dataset format. The older pickle flow is only kept for compatibility. The data
-pipeline now also uses lazy image wrappers so that page images are loaded from
-disk only when a training or inference sample is consumed, instead of keeping
-large PIL objects inside serialized dataset records.
+```text
+chandra_finetuning/
+├── README.md                      # This file
+├── requirements-unsloth.txt       # Python dependencies for the CUDA training env
+│
+├── prompts.py                     # OCR / OCR-layout prompt templates + allowed HTML tags
+├── custom_dataset.py              # Build an Arrow dataset from a single PDF + OCR JSON
+├── prepare_chandra_dataset.py     # Split a dataset into train/test artifacts
+├── train_chandra.py               # LoRA fine-tuning entry point
+├── infer_chandra.py               # Transformers / Unsloth inference + evaluation
+├── inf_vllm.py                    # vLLM server-based inference + evaluation
+├── postprocess.py                 # Clean prediction/reference HTML in result files
+│
+└── chandra_finetune/              # Reusable library package
+    ├── __init__.py                # DEFAULT_MODEL_NAME = "datalab-to/chandra"
+    ├── data.py                    # Dataset loading, normalization, lazy Arrow, splitting
+    ├── modeling.py                # Unsloth FastVisionModel loading + LoRA configuration
+    ├── generation.py              # Single-image text generation helper
+    ├── metrics.py                 # Public metric API (re-exports)
+    └── metrics_relaxed.py         # CER / WER / TEDS / table-TEDS implementations
+```
 
-Evaluation also treats invalid or failed generations more strictly. CER, WER,
-TEDS, and table-level TEDS should reflect real model failures instead of silently
-skipping empty predictions, malformed outputs, or generations that cannot be
-parsed.
 
-## Environment
 
-The current base interpreter in this workspace is Python 3.13, and it does not
-include Unsloth, Transformers, TRL, or Datasets. Use a dedicated CUDA Python
-3.10-3.12 environment for actual training/inference.
+## Requirements
 
+Pinned dependencies (`requirements-unsloth.txt`):
+
+```text
+unsloth
+transformers==4.57.1
+trl==0.22.2
+datasets==4.3.0
+pillow
+pymupdf
+beautifulsoup4
+lxml
+```
+
+---
+
+## Installation
+file:///home/softsensor/Downloads/chandra_full_pipeline_reference.png
 ```bash
+# Create and activate a dedicated environment (3.10–3.12)
 python3.11 -m venv .venv
 source .venv/bin/activate
+
 python -m pip install --upgrade pip
 python -m pip install -r requirements-unsloth.txt
 ```
 
-For GPU training, install the PyTorch build that matches your CUDA driver before
-installing Unsloth if your platform requires a specific wheel.
+---
 
-## Dataset Preparation
+## Pipeline Flow
 
-First create or prepare the Chandra dataset artifacts. Arrow is the default
-format because it stores the dataset in a typed Hugging Face Dataset layout and
-reloads more reliably than a large pickle of PIL objects.
+The project is four stages run in sequence. Raw documents become a dataset, the dataset is split, training produces a LoRA adapter, and inference scores that adapter against the held-out test set.
 
-The pipeline should now be treated as Arrow-first:
+```text
+Stage 1 ─ Dataset      Stage 2 ─ Split        Stage 3 ─ Train
+PDF + OCR JSON  ──────►  train/ + test/  ──────►  best/ + last/
+(custom_dataset.py)     (prepare_chandra_       (train_chandra.py)
+                         dataset.py)                   │
+                                                       ▼
+                                              Stage 4 ─ Inference
+                                              eval via vLLM server
+                                              (inf_vllm.py)
+```
+
+
+### Stage 1 — Dataset creation (`custom_dataset.py`)
+
+```text
+read in-file constants (PDF_PATH, OCR_PATH, OUTPUT_DIR, DPI)
+        │
+        ├── open PDF (PyMuPDF)        ── page count, render handle
+        └── load OCR JSON             ── page → markdown
+        │
+        ▼
+for each annotated page:
+    render page → PNG bytes
+    attach OCR prompt + reference markdown + metadata
+    (skip pages out of range or with empty markdown)
+        │
+        ▼
+write one Arrow dataset directory
+    columns: image · prompt · reference · metadata
+```
+
+This script is self-contained (it does not use the `chandra_finetune` package except the prompt text).
+
+### Stage 2 — Split (`prepare_chandra_dataset.py`)
+
+```text
+load_chandra_dataset(input)        ── read Arrow dir / pkl / json
+        │
+        ▼
+split_samples(test_ratio, seed)    ── deterministic shuffle + split
+        │
+        ├── save_samples_to_arrow()   → train/  and  test/
+        └── save_samples_to_pickle()  (only if --format pickle/both)
+        │
+        ▼
+write split_metadata.json          ── counts + settings
+```
+
+### Stage 3 — Training (`train_chandra.py`)
+
+```text
+load train split (lazy Arrow — images decode one at a time)
+        │
+        ▼
+build LoRA config from CLI args        (LoraSettings)
+        │
+        ▼
+load model + attach adapter            (Unsloth FastVisionModel; base frozen)
+        │
+        ▼
+SFTTrainer loop ──────────────► trains adapter weights only
+        ▲                              │ each epoch
+        │                              ▼
+        └──── Table-TEDS callback: generate on eval set → score →
+              track best adapter → drive early stopping
+        │
+        ▼
+save best/  (highest validation Table-TEDS)
+save last/  (final training step)
+```
+
+### Stage 4 — Inference (`inf_vllm.py`, two terminals)
+
+The model runs in a separate vLLM server you start first. The inference script loads **no** model — it is a client.
+
+```text
+TERMINAL 1 (long-running)            TERMINAL 2 (per run: inf_vllm.py)
+┌───────────────────────┐            load test split
+│ vLLM server           │            health-check server (poll /v1/models)
+│ model + adapter on GPU │◄──────────┐       │
+└───────────────────────┘  POST      │       ▼
+            ▲               /v1/chat/ └── per sample: send image → get text
+            └───────────────completions      │
+                                              ▼
+                                       clean_html()
+                                              │
+                                              ▼
+                                       compute_metrics()   ── penalizes bad output
+                                              │
+                                              ▼
+                                       aggregate_metrics() → write results file
+```
+
+Two values must line up between the terminals: `--vllm-url` must match the server's host/port, and `--vllm-model` must exactly match the adapter name registered in the server's `--lora-modules`. Because the model loads once in terminal 1, you can re-run terminal 2 as often as you like without paying the model-load cost again.
+
+---
+
+## How to Run Each File
+
+Activate your environment first (`source .venv/bin/activate`). Run every command from the project root.
+
+### `custom_dataset.py` — build an Arrow dataset from one PDF
+
+Edit the constants at the top of the file, then run with no arguments:
+
+```bash
+# 1. Open custom_dataset.py and set:
+#    PDF_PATH    = "/path/to/source.pdf"
+#    OCR_PATH    = "/path/to/annotated.json"   # list of {"page": N, "markdown": "..."}
+#    OUTPUT_DIR  = "/path/to/output_arrow_dir"
+#    DPI         = 600
+# 2. Run it:
+python custom_dataset.py
+```
+
+Produces an Arrow dataset directory at `OUTPUT_DIR`. Run once per source document.
+
+### `prepare_chandra_dataset.py` — split into train/test
 
 ```bash
 python prepare_chandra_dataset.py \
@@ -47,213 +188,47 @@ python prepare_chandra_dataset.py \
   --format arrow
 ```
 
-This creates:
+Produces `data/chandra_splits/train/`, `data/chandra_splits/test/`, and `split_metadata.json`.
 
-```text
-data/chandra_splits/
-  train/
-  test/
-  split_metadata.json
-```
-
-The `train/` and `test/` directories are Arrow dataset directories. These are the
-main artifacts used by training and evaluation.
-
-Use `--format pickle` or `--format both` only if you still need `train.pkl` and
-`test.pkl` for an older compatibility path. New training and inference runs
-should prefer Arrow directories.
-
-## Arrow Dataset Format
-
-Arrow is now the expected dataset format for this workflow.
-
-The dataset preparation step writes Hugging Face Dataset directories instead of
-using a single `.pkl` file as the primary source of truth. This is useful because
-Arrow datasets are easier to reload, inspect, split, and reuse across training,
-normal inference, and vLLM inference.
-
-A typical split layout is:
-
-```text
-data/chandra_splits/
-  train/
-    data-00000-of-00001.arrow
-    dataset_info.json
-    state.json
-  test/
-    data-00000-of-00001.arrow
-    dataset_info.json
-    state.json
-  split_metadata.json
-```
-
-Each dataset record contains the fields needed to reconstruct an Unsloth
-vision-language message at runtime. Image data is not expected to be stored as a
-large pickled PIL object. Instead, image references are resolved when the sample
-is loaded.
-
-Keep any generated page-image directory or image paths available after dataset
-creation. The lazy image wrapper depends on those paths being valid during
-training and inference.
-
-## Lazy Image Wrapper
-
-The dataset loading path now supports lazy image wrappers.
-
-Previously, the workflow depended more heavily on pickle-style records that could
-contain in-memory PIL images. That approach made artifacts large, fragile, and
-harder to move between machines. The updated flow keeps image references in the
-dataset and loads the actual image only when it is needed.
-
-The lazy image wrapper is responsible for:
-
-- Keeping Arrow dataset rows lightweight.
-- Opening page images from disk only at sample access time.
-- Converting images into the PIL/RGB shape expected by Chandra and Unsloth.
-- Avoiding loading the full document image set into memory at startup.
-- Making train/test Arrow splits easier to reuse for both inference paths.
-
-This means the dataset artifact and the image files should be treated as a pair.
-Do not delete or move the referenced images after preparing the dataset unless
-you also regenerate or update the dataset references.
-
-## Training
-
-Run LoRA training on the Arrow train split:
+### `train_chandra.py` — fine-tune the LoRA adapter
 
 ```bash
 python train_chandra.py \
   --dataset data/chandra_splits/train \
+  --eval-dataset data/chandra_splits/test \
   --model-name datalab-to/chandra \
   --output-dir outputs/chandra_lora \
-  --num-train-epochs 25 \
+  --num-train-epochs 15 \
   --early-stopping-patience 5
 ```
 
-The training script loads Arrow directories, `.pkl`, `.json`, or `.jsonl`
-datasets, normalizes records into PIL-backed Unsloth messages, applies LoRA
-with the notebook defaults, and saves the adapter plus tokenizer.
-When `--eval-dataset` is omitted, evaluation is forced off and
-`--early-stopping-patience` watches logged training loss instead of validation
-loss. Patience is counted in epochs, using the average logged train loss for
-each epoch. The best epoch train-loss adapter is saved to `--output-dir/best`,
-and the model from the final training step is saved to `--output-dir/last`.
+Produces `outputs/chandra_lora/best/` and `outputs/chandra_lora/last/`. Omit `--eval-dataset` to train without best-model selection (then also omit `--eval-strategy` or set it to `no`).
 
-For new runs, prefer Arrow directories:
+### `inf_vllm.py` — inference + evaluation via vLLM (recommended; two terminals)
 
-```text
-data/chandra_splits/train
-data/chandra_splits/test
-```
-
-`--max-steps` defaults to `-1`, so `--num-train-epochs` controls full-epoch
-training unless you explicitly set a step cap.
-
-### Fold valid plus new OCR/PDF pages into train
-
-If you already have `train.pkl`, `valid.pkl`, and `test.pkl`, and you want the
-final dataset to have only train/test splits, use `merge_chandra_splits.py`.
-It folds `valid.pkl` into train, converts new PDF/OCR JSON page annotations
-into train samples, keeps test separate, and can also export split-specific
-PDFs.
+**Terminal 1 — start the server (leave it running):**
 
 ```bash
-python merge_chandra_splits.py \
-  --train-input /path/to/train.pkl \
-  --valid-input /path/to/valid.pkl \
-  --test-input /path/to/test.pkl \
-  --new-pdf-ocr /path/to/new.pdf /path/to/ocr.json \
-  --output-dir data/chandra_final_splits \
-  --format pickle \
-  --overwrite
+vllm serve datalab-to/chandra \
+  --enable-lora \
+  --lora-modules chandra_lora=outputs/chandra_lora/best \
+  --port 8000
 ```
 
-Repeat `--new-pdf-ocr PDF OCR_JSON` for multiple new PDFs. The script writes:
-
-```text
-data/chandra_final_splits/
-  train.pkl
-  test.pkl
-  new_data.pkl
-  train_pages.pdf
-  test_pages.pdf
-  split_manifest.json
-```
-
-`train_pages.pdf` and `test_pages.pdf` are created automatically unless you
-pass `--no-export-pdfs`. When a sample has `metadata.pdf_path` and
-`metadata.page_number`, the script copies the original PDF page. For older
-pickles without that metadata, it writes the image stored in the pickle as a
-PDF page instead.
-
-If you already converted your new OCR/PDF files with `custom_dataset.py`, pass
-those new `.pkl` files as extra train inputs:
+**Terminal 2 — run inference against it:**
 
 ```bash
-python merge_chandra_splits.py \
-  --train-input /path/to/existing/train.pkl \
-  --train-input /path/to/new_pkls/*/vlm_dataset.pkl /path/to/extra_35_samples.pkl \
-  --test-input /path/to/existing/test.pkl \
-  --output-dir data/chandra_final_splits \
-  --format pickle \
-  --overwrite
+python inf_vllm.py \
+  --dataset data/chandra_splits/test \
+  --vllm-url http://localhost:8000 \
+  --vllm-model chandra_lora \
+  --output vllm_predictions.csv \
+  --metrics cer,wer,teds,table_teds
 ```
 
-You can also pass a directory that contains only the new pickle files:
+`--vllm-model` must match the name on the left of `=` in `--lora-modules`. The client health-checks the server first and waits up to `--wait-timeout` seconds; pass `--no-wait` only if the server is already up. Re-run terminal 2 freely without restarting terminal 1.
 
-```bash
-python merge_chandra_splits.py \
-  --train-input /path/to/existing/train.pkl \
-  --train-input /path/to/new_pkls_dir \
-  --train-input /path/to/extra_35_samples.pkl \
-  --test-input /path/to/existing/test.pkl \
-  --output-dir data/chandra_final_splits \
-  --format pickle \
-  --overwrite
-```
-
-To create each new pickle with metadata:
-
-```bash
-python custom_dataset.py \
-  --pdf /path/to/source.pdf \
-  --ocr-json /path/to/ocr.json \
-  --output-dir /path/to/new_pkls/doc_001
-```
-
-The training flow should:
-
-- Load the Arrow dataset split.
-- Resolve image references lazily.
-- Convert each sample into the Chandra/Unsloth message format.
-- Attach LoRA adapters to `datalab-to/chandra`.
-- Train only the adapter weights.
-- Save the adapter and tokenizer under the configured output directory.
-
-Expected output:
-
-```text
-outputs/chandra_lora/
-  adapter_config.json
-  adapter_model.safetensors
-  tokenizer files
-  training artifacts/logs
-```
-
-## Inference And Evaluation
-
-The repository supports two inference paths:
-
-1. **Normal inference** using `infer_chandra.py`
-2. **vLLM inference** using `inf_vllm.py`
-
-Use normal inference when you want the existing Hugging Face/Unsloth generation
-flow. Use vLLM inference when you want to run generation through the vLLM-based
-path.
-
-Both inference paths should use the same Arrow test split when comparing results.
-
-### Normal Inference
+### `infer_chandra.py` — inference + evaluation in-process (single terminal, no server)
 
 ```bash
 python infer_chandra.py \
@@ -264,159 +239,37 @@ python infer_chandra.py \
   --metrics cer,wer,teds,table_teds
 ```
 
-Dataset inference runs over every sample in the artifact passed to `--dataset`.
-Pass `data/chandra_splits/test` for held-out evaluation.
+Loads the model and adapter in-process (slower to start, reloads every run). Also accepts `--image` or `--pdf` instead of `--dataset`.
 
-Image and PDF inputs are also supported:
 
-```bash
-python infer_chandra.py --image page.png --output page_prediction.jsonl
-python infer_chandra.py --pdf input.pdf --page-range 1-3 --output pdf_predictions.csv
-```
+## Dataset Format
 
-If you have page references in the same annotation JSON shape used by
-`custom_dataset.py`, pass them for PDF metrics:
+Arrow is the expected, primary format. Each record is a typed Hugging Face `Dataset` row with these fields:
 
-```bash
-python infer_chandra.py \
-  --pdf input.pdf \
-  --references-json annotated.json \
-  --reference-field markdown
-```
+| Field | Type | Description |
+| --- | --- | --- |
+| `image` | `datasets.Image` | The page image, stored as PNG bytes (decoded lazily at access time). |
+| `prompt` | `string` | The instruction shown to the model (defaults to the OCR prompt). |
+| `reference` | `string` | Ground-truth HTML/markdown for the page. |
+| `metadata` | `string` | JSON string with provenance such as `pdf_path`, `ocr_path`, `page_number`. |
 
-### vLLM Inference
-
-Use `inf_vllm.py` for the vLLM-based inference flow. This path is useful when
-you want faster generation or want to compare the normal inference output with
-the vLLM output on the same test split.
-
-```bash
-python inf_vllm.py \
-  --dataset data/chandra_splits/test \
-  --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora/best \
-  --output vllm_predictions.csv \
-  --metrics cer,wer,teds,table_teds
-```
-
-When comparing normal inference and vLLM inference, keep the dataset, model,
-adapter, output path, and metrics arguments consistent between both runs.
-
-Recommended comparison flow:
-
-```bash
-# Normal inference
-python infer_chandra.py \
-  --dataset data/chandra_splits/test \
-  --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora/best \
-  --output normal_predictions.jsonl \
-  --metrics cer,wer,teds,table_teds
-
-# vLLM inference
-python inf_vllm.py \
-  --dataset data/chandra_splits/test \
-  --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora/best \
-  --output vllm_predictions.csv \
-  --metrics cer,wer,teds,table_teds
-```
-
-### Switching Between Normal And vLLM Inference
-
-To switch between inference modes, use the corresponding script:
+A typical split directory looks like:
 
 ```text
-infer_chandra.py  -> normal inference
-inf_vllm.py       -> vLLM inference
+data/chandra_splits/
+├── train/
+│   ├── data-00000-of-00001.arrow
+│   ├── dataset_info.json
+│   └── state.json
+├── test/
+│   ├── data-00000-of-00001.arrow
+│   ├── dataset_info.json
+│   └── state.json
+└── split_metadata.json
 ```
 
-Both inference paths should follow the same dataset and output conventions so
-that results can be compared directly.
+The loader also accepts `.pkl` / `.pickle`, `.json`, and `.jsonl` inputs for compatibility, and will pull a list out of a dict under keys like `data`, `samples`, `dataset`, or `records`. At normalization time, each sample is turned into an Unsloth vision conversation: a `user` turn carrying the prompt text and the image, optionally followed by an `assistant` turn carrying the reference.
 
-## Metrics
 
-The evaluation scripts support the following metrics:
 
-- `cer`: normalized character edit distance.
-- `wer`: normalized whitespace-token word edit distance.
-- `teds`: ordered tree similarity over the full parsed HTML.
-- `table_teds`: ordered tree similarity over extracted `<table>` elements only;
-  reported as `n/a` when the reference has no tables.
 
-### Metric Penalization
-
-Metric handling has been updated so that bad generations are counted as failures
-instead of being ignored.
-
-The evaluation path should penalize cases such as:
-
-- Empty model predictions.
-- Failed generation calls.
-- Outputs with no usable OCR text.
-- Malformed HTML when HTML is required for TEDS.
-- Invalid or missing `<table>` structures when table-level scoring is expected.
-- Samples that cannot be parsed or aligned with the expected reference.
-- Runtime failures for individual samples.
-
-This is important because skipping those samples can make the model look better
-than it is. The summary metrics should reflect both output quality and generation
-reliability.
-
-Expected behavior:
-
-- Empty or failed predictions should receive worst-case CER/WER treatment.
-- Invalid HTML should receive poor TEDS treatment instead of being dropped.
-- Missing table output should be penalized when the reference contains tables.
-- Per-sample result files should still record the error or failure reason.
-- Aggregate metrics should include penalized samples.
-
-## Recommended Workflow
-
-Use this order for a clean training and evaluation run:
-
-```bash
-# 1. Prepare Arrow train/test splits
-python prepare_chandra_dataset.py \
-  --input /path/to/vlm_dataset \
-  --output-dir data/chandra_splits \
-  --test-ratio 0.1 \
-  --seed 3407 \
-  --format arrow
-
-# 2. Train LoRA adapter
-python train_chandra.py \
-  --dataset data/chandra_splits/train \
-  --eval-dataset data/chandra_splits/test \
-  --model-name datalab-to/chandra \
-  --output-dir outputs/chandra_lora \
-  --max-steps 30
-
-# 3. Run normal inference
-python infer_chandra.py \
-  --dataset data/chandra_splits/test \
-  --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora \
-  --output normal_predictions.jsonl \
-  --metrics cer,wer,teds,table_teds
-
-# 4. Optionally run vLLM inference
-python inf_vllm.py \
-  --dataset data/chandra_splits/test \
-  --model-name datalab-to/chandra \
-  --adapter outputs/chandra_lora \
-  --output vllm_predictions.csv \
-  --metrics cer,wer,teds,table_teds
-```
-
-## Notes
-
-- Use a CUDA-compatible Python 3.10-3.12 environment for training and inference.
-- Treat Arrow directories as the main dataset format.
-- Treat pickle files as compatibility artifacts only.
-- Keep referenced page images available for lazy loading.
-- Use the same test split when comparing normal inference and vLLM inference.
-- Keep metric penalization enabled so failed samples are reflected in the final
-  evaluation numbers.
-- Review per-sample outputs in addition to aggregate metrics when debugging model
-  behavior.

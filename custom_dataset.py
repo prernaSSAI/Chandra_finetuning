@@ -8,7 +8,7 @@ from prompts import OCR_PROMPT
 
 PDF_PATH    = "/mnt/disk/ml_data/prerna/chandra_pdf/chandra_AH25020.pdf"
 OCR_PATH    = "/mnt/disk/ml_data/prerna/annotated_json/AH250020_corrected.json"
-OUTPUT_DIR  = "/mnt/disk/ml_data/prerna/final_arrow/AH25020"  
+OUTPUT_DIR  = "/mnt/disk/ml_data/prerna/final_arrow/AH25020_dpi300"
 DPI         = 600
 INSTRUCTION = OCR_PROMPT
 

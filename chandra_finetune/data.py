@@ -247,7 +247,7 @@ def build_pdf_samples(
     pdf_path: str | Path,
     *,
     prompt: str = OCR_PROMPT,
-    dpi: int = 200,
+    dpi: int = 300,
     page_range: str | None = None,
     references: dict[int, str] | None = None,
 ) -> list[ChandraSample]:

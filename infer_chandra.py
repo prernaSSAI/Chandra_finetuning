@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", action="append", default=[], help="Image path. Can be repeated.")
     parser.add_argument("--pdf", help="PDF path to render and process.")
     parser.add_argument("--references-json", help="Optional page reference JSON for --pdf inputs.")
-    parser.add_argument("--reference-field", default="markdown", help="Reference text field in --references-json.")
+    parser.add_argument("--referende-field", default="markdown", help="Reference text field in --references-json.")
     parser.add_argument("--page-range", help='PDF pages, for example "1-5,7,9".')
     parser.add_argument("--dpi", type=int, default=600, help="PDF render DPI.")
     parser.add_argument("--prompt-type", default="ocr", choices=sorted(PROMPT_MAPPING), help="Prompt for image/PDF inputs.")
@@ -74,8 +75,10 @@ def main() -> None:
     )
 
     rows: list[dict[str, Any]] = []
+    total_gen_seconds = 0.0
     for index, sample in enumerate(samples, start=1):
         prompt = args.override_prompt or sample.prompt
+        _t0 = time.perf_counter()
         prediction_raw = generate_text(
             model=model,
             tokenizer=tokenizer,
@@ -84,6 +87,8 @@ def main() -> None:
             settings=settings,
             device=args.device,
         )
+        gen_seconds = time.perf_counter() - _t0
+        total_gen_seconds += gen_seconds
         prediction = clean_html(prediction_raw)
         reference_raw = sample.reference
         reference = clean_html(reference_raw) if reference_raw else reference_raw
@@ -95,9 +100,10 @@ def main() -> None:
             "reference": reference,
             "prediction": prediction,
             "metrics": metrics,
+            "gen_seconds": round(gen_seconds, 3),
         }
         rows.append(row)
-        print(_format_progress(row, total=len(samples)))
+        print(f"{_format_progress(row, total=len(samples))} ({gen_seconds:.2f}s)")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +116,11 @@ def main() -> None:
         value = aggregate.get(name)
         printable = "n/a" if value is None else f"{value:.6f}"
         print(f"  {name}: {printable}")
+
+    n = len(rows)
+    print("Timing:")
+    print(f"  total generation: {total_gen_seconds:.1f}s ({total_gen_seconds / 60:.2f} min)")
+    print(f"  avg per page:     {total_gen_seconds / n:.2f}s" if n else "  avg per page: n/a")
 
 
 def write_predictions(path: Path, rows: list[dict[str, Any]], metric_names: list[str]) -> None:

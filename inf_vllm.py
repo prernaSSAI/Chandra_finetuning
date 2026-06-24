@@ -6,9 +6,11 @@ import argparse
 import base64
 import io
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -76,8 +78,8 @@ def generate_text_vllm(
     image: Any,
     prompt: str,
     max_new_tokens: int = 12384,
-    request_timeout: int = 300,
-    retry_attempts: int = 3,
+    request_timeout: int = 600,
+    retry_attempts: int = 5,
     retry_delay: float = 5.0,
 ) -> str:
     """Send one image+prompt to the vLLM server and return the generated text."""
@@ -161,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-field", default="markdown",
                         help="Reference text field in --references-json.")
     parser.add_argument("--page-range", help='PDF pages, e.g. "1-5,7,9".')
-    parser.add_argument("--dpi", type=int, default=600, help="PDF render DPI.")
+    parser.add_argument("--dpi", type=int, default=300, help="PDF render DPI.")
     parser.add_argument("--prompt-type", default="ocr", choices=sorted(PROMPT_MAPPING),
                         help="Prompt for image/PDF inputs.")
     parser.add_argument("--override-prompt", help="Force this prompt for every sample.")
@@ -188,6 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Retry count per sample on transient network errors (default: 3).")
     parser.add_argument("--retry-delay", type=float, default=5.0,
                         help="Seconds between retries (default: 5).")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Number of pages to process in parallel (default: 1 = sequential). "
+                             "Set to 4-8 for concurrent inference with vLLM continuous batching.")
 
     # --- Legacy flags (accepted but ignored so existing scripts don't break) ---
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME,
@@ -209,6 +214,64 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
+# Single-page inference worker (used by both sequential and concurrent modes)
+# ---------------------------------------------------------------------------
+
+def _process_one_page(
+    *,
+    index: int,
+    sample: ChandraSample,
+    args: argparse.Namespace,
+    metric_names: list[str],
+) -> dict[str, Any]:
+    """Run inference + metrics for a single page. Returns the result row dict.
+
+    On failure, returns a row with an 'error' key instead of raising.
+    """
+    prompt = args.override_prompt or sample.prompt
+    reference_raw = sample.reference
+    reference = clean_html(reference_raw) if reference_raw else reference_raw
+
+    _t0 = time.perf_counter()
+    try:
+        prediction_raw = generate_text_vllm(
+            vllm_url=args.vllm_url,
+            model=args.vllm_model,
+            image=sample.image,
+            prompt=prompt,
+            max_new_tokens=args.max_new_tokens,
+            request_timeout=args.request_timeout,
+            retry_attempts=args.retry_attempts,
+            retry_delay=args.retry_delay,
+        )
+    except Exception as exc:
+        gen_seconds = time.perf_counter() - _t0
+        return {
+            "index": index,
+            "metadata": sample.metadata or {},
+            "prompt": prompt,
+            "reference": reference,
+            "prediction": "",
+            "metrics": {},
+            "gen_seconds": round(gen_seconds, 3),
+            "error": str(exc),
+        }
+
+    gen_seconds = time.perf_counter() - _t0
+    prediction = clean_html(prediction_raw)
+    metrics = compute_metrics(prediction, reference, metric_names=metric_names)
+    return {
+        "index": index,
+        "metadata": sample.metadata or {},
+        "prompt": prompt,
+        "reference": reference,
+        "prediction": prediction,
+        "metrics": metrics,
+        "gen_seconds": round(gen_seconds, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -218,7 +281,7 @@ def main() -> None:
     # Warn about ignored legacy flags.
     if args.adapter:
         print(
-            f"[INFO] --adapter={args.adapter!r} is ignored when using vLLM. "
+            f"[INFO] --adapterargs={args.adapter!r} is ignored when using vLLM. "
             "The LoRA adapter is loaded by the server via --lora-modules."
         )
     if args.load_in_4bit:
@@ -235,52 +298,148 @@ def main() -> None:
     if not args.no_wait:
         wait_for_vllm(args.vllm_url, args.vllm_model, timeout=args.wait_timeout)
 
-    rows: list[dict[str, Any]] = []
-    for index, sample in enumerate(samples, start=1):
-        prompt = args.override_prompt or sample.prompt
-
-        # ------------------------------------------------------------------ #
-        # REPLACEMENT: vLLM API call instead of generate_text(model, …)       #
-        # ------------------------------------------------------------------ #
-        prediction_raw = generate_text_vllm(
-            vllm_url=args.vllm_url,
-            model=args.vllm_model,
-            image=sample.image,
-            prompt=prompt,
-            max_new_tokens=args.max_new_tokens,
-            request_timeout=args.request_timeout,
-            retry_attempts=args.retry_attempts,
-            retry_delay=args.retry_delay,
-        )
-        # ------------------------------------------------------------------ #
-
-        # Everything below is identical to the original infer_chandra.py.
-        prediction = clean_html(prediction_raw)
-        reference_raw = sample.reference
-        reference = clean_html(reference_raw) if reference_raw else reference_raw
-        metrics = compute_metrics(prediction, reference, metric_names=metric_names)
-        row = {
-            "index": index,
-            "metadata": sample.metadata or {},
-            "prompt": prompt,
-            "reference": reference,
-            "prediction": prediction,
-            "metrics": metrics,
-        }
-        rows.append(row)
-        print(_format_progress(row, total=len(samples)))
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_predictions(output_path, rows)
+
+    # Resume: reload any previously-saved predictions so a re-run skips pages
+    # that already succeeded (failed pages, marked with "error", are retried).
+    rows: list[dict[str, Any]] = []
+    done_indices: set[int] = set()
+    if output_path.exists():
+        try:
+            with output_path.open("r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+            for r in existing:
+                if isinstance(r, dict) and r.get("index") is not None and not r.get("error"):
+                    rows.append(r)
+                    done_indices.add(int(r["index"]))
+            if done_indices:
+                print(f"[resume] {len(done_indices)} completed pages found in {output_path}; skipping them.")
+        except Exception as exc:
+            print(f"[resume] Could not read existing {output_path} ({exc}); starting fresh.")
+            rows, done_indices = [], set()
+
+    # Build the list of (index, sample) pairs that still need processing.
+    pending = [
+        (index, sample)
+        for index, sample in enumerate(samples, start=1)
+        if index not in done_indices
+    ]
+
+    wall_start = time.perf_counter()
+    if not pending:
+        print("All pages already completed. Nothing to do.")
+    else:
+        concurrency = max(1, args.concurrency)
+        print(f"Processing {len(pending)} pages with concurrency={concurrency} …")
+
+        if concurrency == 1:
+            # --- Sequential mode (original behaviour) ---
+            _run_sequential(pending, args, metric_names, rows, output_path, len(samples))
+        else:
+            # --- Concurrent mode ---
+            _run_concurrent(pending, args, metric_names, rows, output_path, len(samples), concurrency)
+    wall_elapsed = time.perf_counter() - wall_start
 
     aggregate = aggregate_metrics(rows)
-    print(f"Wrote {len(rows)} predictions to {output_path}")
+    failed = sum(1 for r in rows if r.get("error"))
+    generated = len(rows) - failed
+    total_gen_seconds = sum(r.get("gen_seconds", 0) for r in rows if not r.get("error"))
+
+    print(f"\nWrote {len(rows)} predictions to {output_path}")
+    if failed:
+        print(f"  WARNING: {failed} page(s) failed (saved with empty prediction + 'error'). Re-run to retry just those.")
     print("Aggregate metrics:")
     for name in metric_names:
         value = aggregate.get(name)
         printable = "n/a" if value is None else f"{value:.6f}"
         print(f"  {name}: {printable}")
+
+    print("Timing:")
+    print(f"  pages generated: {generated}")
+    print(f"  wall-clock time: {wall_elapsed:.1f}s ({wall_elapsed / 60:.2f} min)")
+    print(f"  sum of gen_seconds: {total_gen_seconds:.1f}s ({total_gen_seconds / 60:.2f} min)")
+    print(f"  avg per page (wall): {wall_elapsed / generated:.2f}s" if generated else "  avg per page: n/a")
+
+
+def _run_sequential(
+    pending: list[tuple[int, ChandraSample]],
+    args: argparse.Namespace,
+    metric_names: list[str],
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    total_samples: int,
+) -> None:
+    """Process pages one at a time (original behaviour)."""
+    for index, sample in pending:
+        row = _process_one_page(
+            index=index, sample=sample, args=args, metric_names=metric_names,
+        )
+        rows.append(row)
+        rows.sort(key=lambda r: r.get("index", 0))
+        write_predictions(output_path, rows)
+
+        if row.get("error"):
+            print(f"[{index}/{total_samples}] FAILED: {row['error']} ({row['gen_seconds']:.1f}s) — continuing")
+        else:
+            print(f"{_format_progress(row, total=total_samples)} ({row['gen_seconds']:.2f}s)")
+
+
+def _run_concurrent(
+    pending: list[tuple[int, ChandraSample]],
+    args: argparse.Namespace,
+    metric_names: list[str],
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    total_samples: int,
+    concurrency: int,
+) -> None:
+    """Process pages in parallel using a thread pool.
+
+    vLLM handles concurrent requests via continuous batching on the GPU side.
+    We use threads (not processes) because the work is I/O-bound (HTTP calls).
+    """
+    save_lock = threading.Lock()
+    completed = 0
+
+    def _on_result(row: dict[str, Any]) -> None:
+        nonlocal completed
+        with save_lock:
+            rows.append(row)
+            rows.sort(key=lambda r: r.get("index", 0))
+            write_predictions(output_path, rows)
+            completed += 1
+            if row.get("error"):
+                print(f"[{row['index']}/{total_samples}] (done {completed}/{len(pending)}) "
+                      f"FAILED: {row['error']} ({row['gen_seconds']:.1f}s)")
+            else:
+                print(f"[{row['index']}/{total_samples}] (done {completed}/{len(pending)}) "
+                      f"{_format_metrics(row)} ({row['gen_seconds']:.2f}s)")
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(
+                _process_one_page,
+                index=index,
+                sample=sample,
+                args=args,
+                metric_names=metric_names,
+            ): index
+            for index, sample in pending
+        }
+        for future in as_completed(futures):
+            row = future.result()
+            _on_result(row)
+
+
+def _format_metrics(row: dict[str, Any]) -> str:
+    """Format metrics from a row dict into a compact string."""
+    metrics = row.get("metrics") or {}
+    parts = []
+    for name, value in metrics.items():
+        formatted = "n/a" if value is None else f"{value:.4f}"
+        parts.append(f"{name}={formatted}")
+    return ", ".join(parts) or "metrics=n/a"
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import shutil
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
@@ -19,137 +20,102 @@ from chandra_finetune.data import (
 )
 from chandra_finetune.generation import GenerationSettings, generate_text
 from chandra_finetune.metrics import table_teds_score
-from chandra_finetune.modeling import LoraSettings, load_training_model, set_training_mode
+from chandra_finetune.modeling import LoraSettings, load_training_model, set_inference_mode, set_training_mode
 
 
 DEFAULT_BEST_METRIC = "table_teds"
 DEFAULT_GREATER_IS_BETTER = True
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fine-tune Chandra with Unsloth LoRA.")
-    parser.add_argument("--dataset", required=True, help="Training dataset artifact: Arrow dir, .pkl, .json, or .jsonl.")
-    parser.add_argument("--model-name", "--model-path", dest="model_name", default=DEFAULT_MODEL_NAME, help="Base model checkpoint.")
-    parser.add_argument("--output-dir", default="outputs/chandra_lora", help="Directory for LoRA adapter output.")
-    parser.add_argument("--eval-dataset", help="Optional held-out dataset path for Table-TEDS validation.")
-    parser.add_argument("--seed", type=int, default=3407, help="Random seed for LoRA and trainer config.")
-    parser.add_argument("--max-samples", type=int, default=None, help="Optional cap for debugging.")
-    parser.add_argument("--max-eval-samples", type=int, default=None, help="Optional cap for generated Table-TEDS evaluation.")
+@dataclass
+class TrainConfig:
+    """All training hyperparameters — edit these values directly in code.
 
-    parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--gradient-checkpointing", default="unsloth", help='Use "unsloth", "true", "false", or "none".')
+    These were previously command-line flags. They now live here so a run is
+    fully reproducible from this file and there are no CLI args to remember.
+    To start a run, edit the values below and run:  python train_chandra.py
 
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--lora-bias", "--bias", dest="lora_bias", default="none")
-    parser.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--finetune-vision-layers", "--vision-layers", dest="finetune_vision_layers", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--finetune-language-layers", "--language-layers", dest="finetune_language_layers", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--finetune-attention-modules", "--attention-modules", dest="finetune_attention_modules", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--finetune-mlp-modules", "--mlp-modules", dest="finetune_mlp_modules", action=argparse.BooleanOptionalAction, default=False)
+    Table-TEDS validation (kept fully intact, just OFF by default):
+        Leave ``eval_dataset = None`` to train on train-loss only. In that mode
+        there is NO per-epoch generation and NO Table-TEDS scoring; the final
+        (lowest train-loss) checkpoint is saved to <output_dir>/last and
+        <output_dir>/best is a copy of it.
+        Set ``eval_dataset`` to a path and per-epoch Table-TEDS evaluation,
+        best-model selection, and early stopping turn back on automatically —
+        eval_strategy/save_strategy are switched to "epoch" for you in main().
+    """
 
-    parser.add_argument("--per-device-train-batch-size", "--batch-size-per-device", dest="per_device_train_batch_size", type=int, default=2)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--warmup-steps", type=int, default=50)
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=-1,
-        help="Maximum optimizer steps. Keep -1 to train for the requested number of epochs.",
-    )
-    parser.add_argument("--num-train-epochs", "--epochs", dest="num_train_epochs", type=float, default=50.0)
-    parser.add_argument(
-        "--resume-from-checkpoint",
-        default=None,
-        help="Path to a Trainer checkpoint directory to resume model, optimizer, scheduler, and trainer state.",
-    )
+    # ── Data ─────────────────────────────────────────────────────────────
+    # Training dataset artifact: Arrow dir, .pkl, .json, or .jsonl.
+    dataset: str = "REPLACE_WITH_TRAINING_DATASET_PATH"
+    # Optional held-out dataset for Table-TEDS validation. None = train-loss only.
+    eval_dataset: str | None = None
+    max_samples: int | None = None        # cap training samples (debugging)
+    max_eval_samples: int | None = None   # cap eval samples for Table-TEDS
 
-    parser.add_argument(
-    "--resume-best-table-teds",
-    type=float,
-    default=None,
-    help="Best validation Table-TEDS score from the previous interrupted run.",
-)
-    parser.add_argument(
-        "--resume-best-epoch",
-        type=float,
-        default=None,
-        help="Epoch where the previous best Table-TEDS was achieved.",
-    )
-    parser.add_argument(
-        "--resume-best-step",
-        type=int,
-        default=None,
-        help="Global step where the previous best Table-TEDS was achieved.",
-    )
+    # ── Model / output ───────────────────────────────────────────────────
+    model_name: str = DEFAULT_MODEL_NAME  # base model checkpoint
+    output_dir: str = "outputs/chandra_lora"
+    seed: int = 3407
 
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
-    parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--optim", default="adamw_8bit")
-    parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--lr-scheduler-type", default="cosine")
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--report-to", default="none")
-    parser.add_argument("--eval-strategy", default="epoch", help='Evaluation strategy, e.g. "no", "steps", or "epoch".')
-    parser.add_argument(
-        "--save-strategy",
-        default="epoch",
-        help='Trainer checkpoint save strategy, e.g. "no", "steps", or "epoch". Best/last adapters are always saved separately.',
-    )
-    parser.add_argument(
-        "--load-best-model-at-end",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use Hugging Face Trainer best-checkpoint loading when possible. The custom Table-TEDS callback still saves the best LoRA adapter.",
-    )
-    parser.add_argument(
-        "--metric-for-best-model",
-        default=DEFAULT_BEST_METRIC,
-        help='Metric used by Trainer best-checkpoint logic. Defaults to "table_teds".',
-    )
-    parser.add_argument(
-        "--greater-is-better",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_GREATER_IS_BETTER,
-        help="Table-TEDS is a score, so higher is better.",
-    )
-    parser.add_argument(
-        "--early-stopping-patience",
-        "--patience",
-        dest="early_stopping_patience",
-        type=int,
-        default=15,
-        help="Stop after this many validation epochs without Table-TEDS improvement.",
-    )
-    parser.add_argument(
-        "--early-stopping-threshold",
-        type=float,
-        default=0.0,
-        help="Minimum Table-TEDS increase required to reset early-stopping patience.",
-    )
-    parser.add_argument(
-        "--early-stopping-min-steps",
-        type=int,
-        default=0,
-        help="Do not stop early before this many optimizer steps.",
-    )
-    parser.add_argument("--eval-generation-max-new-tokens", type=int, default=112384)
-    parser.add_argument("--eval-generation-temperature", type=float, default=0.0)
-    parser.add_argument("--eval-generation-top-p", type=float, default=1.0)
-    parser.add_argument("--eval-generation-top-k", type=int, default=0)
-    parser.add_argument("--eval-generation-repetition-penalty", type=float, default=1.0)
-    parser.add_argument(
-        "--table-teds-exclude-first-table",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Pass exclude_first_table to table_teds_score().",
-    )
-    return parser
+    # ── LoRA ─────────────────────────────────────────────────────────────
+    load_in_4bit: bool = False
+    gradient_checkpointing: str = "unsloth"  # "unsloth" | "true" | "false" | "none"
+    lora_r: int = 32
+    lora_alpha: int = 32
+    lora_dropout: float = 0.08
+    lora_bias: str = "none"
+    use_rslora: bool = False
+    finetune_vision_layers: bool = False
+    finetune_language_layers: bool = True
+    finetune_attention_modules: bool = True
+    finetune_mlp_modules: bool = False
+
+    # ── Optimization ─────────────────────────────────────────────────────
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 4
+    warmup_steps: int = 100
+    max_steps: int = -1                   # -1 = train for num_train_epochs
+    num_train_epochs: float = 15.0
+    learning_rate: float = 1e-5
+    optim: str = "adamw_8bit"
+    weight_decay: float = 0.02
+    lr_scheduler_type: str = "cosine"
+    max_length: int = 2048
+    logging_steps: int = 1
+    report_to: str = "none"
+
+    # ── Checkpointing / best-model selection ─────────────────────────────
+    # When eval_dataset is None these stay effectively off (train-loss only).
+    # When eval_dataset is set, "no" values are auto-bumped to "epoch" in main().
+    eval_strategy: str = "no"             # "no" | "steps" | "epoch"
+    save_strategy: str = "epoch"          # "no" | "steps" | "epoch"
+    load_best_model_at_end: bool = True   # auto-disabled when eval_dataset is None
+    metric_for_best_model: str = DEFAULT_BEST_METRIC
+    greater_is_better: bool = DEFAULT_GREATER_IS_BETTER
+
+    # ── Resume (set when continuing an interrupted run) ──────────────────
+    resume_from_checkpoint: str | None = None
+    resume_best_table_teds: float | None = None
+    resume_best_epoch: float | None = None
+    resume_best_step: int | None = None
+
+    # ── Early stopping (only active when Table-TEDS eval is enabled) ─────
+    early_stopping_patience: int = 5
+    early_stopping_threshold: float = 0.0
+    early_stopping_min_steps: int = 0
+
+    # ── Table-TEDS validation generation (only used when eval is enabled) ─
+    eval_generation_max_new_tokens: int = 12384
+    eval_generation_temperature: float = 0.0
+    eval_generation_top_p: float = 1.0
+    eval_generation_top_k: int = 0
+    eval_generation_repetition_penalty: float = 1.0
+    table_teds_exclude_first_table: bool = True
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    args = TrainConfig()
 
     # ── Load training data (lazy for Arrow, eager for pkl/json) ──────────
     train_dataset = load_lazy_training_dataset(
@@ -191,15 +157,17 @@ def main() -> None:
 
     train_only = eval_dataset is None
     if train_only:
-        if args.eval_strategy not in (None, "no"):
-            raise ValueError(
-                "No eval dataset was loaded, so --eval-strategy must be omitted or set to 'no'. "
-                "Pass --eval-dataset to enable generated Table-TEDS model selection."
-            )
+        # No eval dataset → train on train-loss only. No per-epoch generation or
+        # Table-TEDS. Best model becomes a copy of the final (lowest-loss) one.
         args.eval_strategy = "no"
         args.load_best_model_at_end = False
         print("No eval dataset was loaded; Table-TEDS best-model selection and early stopping are disabled.")
     else:
+        # Eval dataset present → turn Table-TEDS validation back on automatically.
+        if args.eval_strategy == "no":
+            args.eval_strategy = "epoch"
+        if args.save_strategy == "no":
+            args.save_strategy = "epoch"
         _validate_table_teds_best_model_args(args)
 
     lora = LoraSettings(
@@ -342,7 +310,7 @@ def main() -> None:
     print(f"Saved LoRA adapter and tokenizer under {output_dir / 'best'} and {output_dir / 'last'}")
 
 
-def _validate_table_teds_best_model_args(args: argparse.Namespace) -> None:
+def _validate_table_teds_best_model_args(args: TrainConfig) -> None:
     if args.early_stopping_patience is not None and args.early_stopping_patience < 1:
         raise ValueError("--early-stopping-patience/--patience must be >= 1.")
     if args.early_stopping_threshold < 0:
@@ -439,7 +407,10 @@ def _build_table_teds_monitor_callback(
 
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
             model = kwargs.get("model")
+            eval_start = time.perf_counter()
             score, num_scored, num_skipped = self._evaluate_table_teds(model)
+            eval_seconds = time.perf_counter() - eval_start
+            seconds_per_page = (eval_seconds / num_scored) if num_scored else float("nan")
             epoch = float(state.epoch) if state.epoch is not None else None
             self.last_score = score
             self.last_epoch = epoch
@@ -484,6 +455,8 @@ def _build_table_teds_monitor_callback(
                     f"validation_table_teds={score_text} "
                     f"best_validation_table_teds={best_text} "
                     f"scored={num_scored} skipped={num_skipped} "
+                    f"eval_seconds={eval_seconds:.1f} "
+                    f"seconds_per_page={seconds_per_page:.2f} "
                     f"saved_new_best={saved}"
                 )
                 if self.stopped_early:
@@ -521,44 +494,50 @@ def _build_table_teds_monitor_callback(
             if model is None or not eval_samples:
                 return None, 0, len(eval_samples)
 
-            was_training = bool(getattr(model, "training", False))
+            # Switch to Unsloth inference mode so gradient checkpointing is
+            # disabled and the KV cache (use_cache) is re-enabled during
+            # generation.  Without this, grad checkpointing stays active and HF
+            # forces use_cache=False, making every decode step recompute the
+            # full sequence (O(n^2)).  Always restore training mode afterward.
             try:
-                model.eval()
+                set_inference_mode(model)
             except Exception:
                 pass
 
             scores: list[float] = []
             skipped = 0
-            for sample in eval_samples:
-                reference = sample.reference
-                if reference is None or not str(reference).strip():
-                    skipped += 1
-                    continue
+            try:
+                for sample in eval_samples:
+                    reference = sample.reference
+                    if reference is None or not str(reference).strip():
+                        skipped += 1
+                        continue
+                    try:
+                        prediction = generate_text(
+                            model=model,
+                            tokenizer=tokenizer,
+                            image=sample.image,
+                            prompt=sample.prompt,
+                            settings=generation_settings,
+                        )
+                        score = table_teds_score(
+                            prediction,
+                            reference,
+                            exclude_first_table=exclude_first_table,
+                        )
+                    except Exception as exc:
+                        skipped += 1
+                        print(f"WARNING: Skipping eval sample after Table-TEDS error: {exc}")
+                        continue
+                    if score is None or not math.isfinite(float(score)):
+                        skipped += 1
+                        continue
+                    scores.append(float(score))
+            finally:
+                # Restore training mode (re-enables gradient checkpointing) so
+                # the next training epoch is unaffected.
                 try:
-                    prediction = generate_text(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image=sample.image,
-                        prompt=sample.prompt,
-                        settings=generation_settings,
-                    )
-                    score = table_teds_score(
-                        prediction,
-                        reference,
-                        exclude_first_table=exclude_first_table,
-                    )
-                except Exception as exc:
-                    skipped += 1
-                    print(f"WARNING: Skipping eval sample after Table-TEDS error: {exc}")
-                    continue
-                if score is None or not math.isfinite(float(score)):
-                    skipped += 1
-                    continue
-                scores.append(float(score))
-
-            if was_training:
-                try:
-                    model.train()
+                    set_training_mode(model)
                 except Exception:
                     pass
 
@@ -591,7 +570,7 @@ def _copy_saved_model_files(source_dir: Path, target_dir: Path) -> None:
 
 def _write_run_metadata(
     output_dir: Path,
-    args: argparse.Namespace,
+    args: TrainConfig,
     metrics: dict,
     *,
     extra_metadata: dict | None = None,
