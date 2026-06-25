@@ -29,25 +29,10 @@ DEFAULT_GREATER_IS_BETTER = True
 
 @dataclass
 class TrainConfig:
-    """All training hyperparameters — edit these values directly in code.
+   
 
-    These were previously command-line flags. They now live here so a run is
-    fully reproducible from this file and there are no CLI args to remember.
-    To start a run, edit the values below and run:  python train_chandra.py
-
-    Table-TEDS validation (kept fully intact, just OFF by default):
-        Leave ``eval_dataset = None`` to train on train-loss only. In that mode
-        there is NO per-epoch generation and NO Table-TEDS scoring; the final
-        (lowest train-loss) checkpoint is saved to <output_dir>/last and
-        <output_dir>/best is a copy of it.
-        Set ``eval_dataset`` to a path and per-epoch Table-TEDS evaluation,
-        best-model selection, and early stopping turn back on automatically —
-        eval_strategy/save_strategy are switched to "epoch" for you in main().
-    """
-
-    # ── Data ─────────────────────────────────────────────────────────────
-    # Training dataset artifact: Arrow dir, .pkl, .json, or .jsonl.
-    dataset: str = "REPLACE_WITH_TRAINING_DATASET_PATH"
+   
+    dataset: str = "/mnt/disk/ml_data/prerna/finetune_train_data"
     # Optional held-out dataset for Table-TEDS validation. None = train-loss only.
     eval_dataset: str | None = None
     max_samples: int | None = None        # cap training samples (debugging)
@@ -55,15 +40,15 @@ class TrainConfig:
 
     # ── Model / output ───────────────────────────────────────────────────
     model_name: str = DEFAULT_MODEL_NAME  # base model checkpoint
-    output_dir: str = "outputs/chandra_lora"
+    output_dir: str = "/mnt/disk/ml_data/prerna/iter_5"
     seed: int = 3407
 
     # ── LoRA ─────────────────────────────────────────────────────────────
     load_in_4bit: bool = False
     gradient_checkpointing: str = "unsloth"  # "unsloth" | "true" | "false" | "none"
-    lora_r: int = 32
-    lora_alpha: int = 32
-    lora_dropout: float = 0.08
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
     lora_bias: str = "none"
     use_rslora: bool = False
     finetune_vision_layers: bool = False
@@ -74,20 +59,20 @@ class TrainConfig:
     # ── Optimization ─────────────────────────────────────────────────────
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
-    warmup_steps: int = 100
+    warmup_steps: int = 50
     max_steps: int = -1                   # -1 = train for num_train_epochs
     num_train_epochs: float = 15.0
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-5
     optim: str = "adamw_8bit"
-    weight_decay: float = 0.02
+    weight_decay: float = 0.05
     lr_scheduler_type: str = "cosine"
     max_length: int = 2048
     logging_steps: int = 1
+    logging_strategy: str = "epoch"
+    disable_tqdm: bool = False
     report_to: str = "none"
 
     # ── Checkpointing / best-model selection ─────────────────────────────
-    # When eval_dataset is None these stay effectively off (train-loss only).
-    # When eval_dataset is set, "no" values are auto-bumped to "epoch" in main().
     eval_strategy: str = "no"             # "no" | "steps" | "epoch"
     save_strategy: str = "epoch"          # "no" | "steps" | "epoch"
     load_best_model_at_end: bool = True   # auto-disabled when eval_dataset is None
@@ -207,6 +192,8 @@ def main() -> None:
         "max_steps": args.max_steps,
         "learning_rate": args.learning_rate,
         "logging_steps": args.logging_steps,
+        "logging_strategy": args.logging_strategy,
+        "disable_tqdm": args.disable_tqdm,
         "optim": args.optim,
         "weight_decay": args.weight_decay,
         "lr_scheduler_type": args.lr_scheduler_type,
@@ -253,6 +240,24 @@ def main() -> None:
         initial_best_step=args.resume_best_step,
     )
 
+    # Train-loss best-model tracker. Active only in train-only mode (no eval
+    # dataset): saves the LoRA adapter at the epoch with the lowest mean training
+    # loss so the final <output_dir>/best is the least-train-loss epoch rather
+    # than the last step. No effect when Table-TEDS validation is enabled.
+    best_train_loss_dir = Path(args.output_dir) / ".best_train_loss_tmp"
+    if best_train_loss_dir.exists() and args.resume_from_checkpoint is None:
+        shutil.rmtree(best_train_loss_dir)
+    train_loss_monitor = _build_train_loss_monitor_callback(
+        TrainerCallback,
+        tokenizer=tokenizer,
+        best_model_dir=best_train_loss_dir,
+        enabled=train_only,
+    )
+
+    callbacks = [table_teds_monitor]
+    if train_only:
+        callbacks.append(train_loss_monitor)
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -260,7 +265,7 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=SFTConfig(**trainer_kwargs),
-        callbacks=[table_teds_monitor],
+        callbacks=callbacks,
     )
 
     print(f"Training with {num_train} train samples and {num_eval} eval samples.")
@@ -295,16 +300,31 @@ def main() -> None:
             f"step {table_teds_monitor.best_step}, "
             f"table_teds {table_teds_monitor.best_score:.6f}) to {best_dir}"
         )
+    elif train_only and train_loss_monitor.best_model_dir.exists():
+        _recreate_dir(best_dir)
+        _copy_saved_model_files(train_loss_monitor.best_model_dir, best_dir)
+        shutil.rmtree(train_loss_monitor.best_model_dir)
+        print(
+            f"Saved best train-loss model "
+            f"(epoch {train_loss_monitor.best_epoch}, "
+            f"step {train_loss_monitor.best_step}, "
+            f"train_loss {train_loss_monitor.best_loss:.6f}) to {best_dir}"
+        )
+        # "load best model at end" for train-only mode: reload the lowest
+        # train-loss adapter into the live model so the returned model matches
+        # best/ (last/ above keeps the final-step weights). HF's native
+        # load_best_model_at_end can't do this without an eval metric.
     else:
         _recreate_dir(best_dir)
         _copy_saved_model_files(last_dir, best_dir)
-        print("WARNING: No valid validation table_teds was computed; copied last model to best as a fallback.")
+        print("WARNING: No best checkpoint was tracked; copied last model to best as a fallback.")
 
     extra_metadata = {
         "table_teds_monitor": {
             **table_teds_monitor.summary(),
             "best_model_dir": str(best_dir),
-        }
+        },
+        "train_loss_monitor": train_loss_monitor.summary(),
     }
     _write_run_metadata(output_dir, args, trainer_stats.metrics, extra_metadata=extra_metadata)
     print(f"Saved LoRA adapter and tokenizer under {output_dir / 'best'} and {output_dir / 'last'}")
@@ -551,6 +571,122 @@ def _build_table_teds_monitor_callback(
             tokenizer.save_pretrained(self.best_model_dir)
 
     return TableTEDSMonitorCallback()
+
+
+def _build_train_loss_monitor_callback(
+    trainer_callback_cls: type,
+    *,
+    tokenizer,
+    best_model_dir: Path,
+    enabled: bool,
+):
+    """Track the lowest *per-epoch* mean training loss and save the adapter at it.
+
+    Used in train-only mode (no eval dataset) so the final best checkpoint is
+    the epoch with the least average train loss rather than the last training
+    step (or a single noisy low-loss step). on_log accumulates the smoothed
+    training ``loss`` logged every logging_steps; on_epoch_end averages those
+    losses for the just-finished epoch and saves the adapter only when that
+    epoch's mean is a new minimum.
+    """
+
+    class TrainLossMonitorCallback(trainer_callback_cls):
+        def __init__(self) -> None:
+            self.best_loss: float | None = None
+            self.best_epoch: float | None = None
+            self.best_step: int | None = None
+            self.last_loss: float | None = None
+            self.best_model_dir = best_model_dir
+            # Accumulators for the in-progress epoch.
+            self._epoch_loss_sum: float = 0.0
+            self._epoch_loss_count: int = 0
+            # Guard so each epoch is scored/saved exactly once, whether its loss
+            # is logged DURING the epoch (logging_strategy="steps") or AFTER
+            # on_epoch_end (logging_strategy="epoch").
+            self._finalized_epoch_key: int | None = None
+
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            self._epoch_loss_sum = 0.0
+            self._epoch_loss_count = 0
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not enabled or not logs:
+                return control
+            loss = logs.get("loss")
+            if loss is None:
+                return control
+            try:
+                loss = float(loss)
+            except (TypeError, ValueError):
+                return control
+            if not math.isfinite(loss):
+                return control
+            self.last_loss = loss
+            self._epoch_loss_sum += loss
+            self._epoch_loss_count += 1
+            # In logging_strategy="epoch" the epoch's loss is logged AFTER
+            # on_epoch_end, so finalize here too. No optimizer step happens
+            # between on_epoch_end and this log, so the model is still at its
+            # exact end-of-epoch state — safe to save.
+            self._maybe_finalize(state, kwargs.get("model"))
+            return control
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            # In logging_strategy="steps" the per-step losses are already
+            # logged during the epoch, so the mean is ready here.
+            self._maybe_finalize(state, kwargs.get("model"))
+            return control
+
+        def _maybe_finalize(self, state, model) -> None:
+            if not enabled or self._epoch_loss_count == 0:
+                return
+            epoch_key = (
+                int(round(state.epoch)) if state.epoch is not None else state.global_step
+            )
+            if self._finalized_epoch_key == epoch_key:
+                return
+            self._finalized_epoch_key = epoch_key
+            epoch_loss = self._epoch_loss_sum / self._epoch_loss_count
+            epoch = float(state.epoch) if state.epoch is not None else None
+            if self.best_loss is None or epoch_loss < self.best_loss:
+                self.best_loss = epoch_loss
+                self.best_epoch = epoch
+                self.best_step = state.global_step
+                self._save_best_model(model, state)
+                if state.is_local_process_zero:
+                    print(
+                        "[train_loss] new best epoch "
+                        f"mean_loss={epoch_loss:.6f} epoch={epoch} "
+                        f"global_step={state.global_step} (saved adapter)"
+                    )
+            elif state.is_local_process_zero:
+                print(
+                    "[train_loss] epoch "
+                    f"mean_loss={epoch_loss:.6f} epoch={epoch} "
+                    f"(best is {self.best_loss:.6f} @ epoch {self.best_epoch}; not saved)"
+                )
+
+        def summary(self) -> dict:
+            return {
+                "enabled": enabled,
+                "metric": "train_loss_epoch_mean",
+                "greater_is_better": False,
+                "best_loss": self.best_loss,
+                "best_epoch": self.best_epoch,
+                "best_step": self.best_step,
+                "last_loss": self.last_loss,
+                "best_model_dir": str(self.best_model_dir),
+            }
+
+        def _save_best_model(self, model, state) -> None:
+            if model is None or not state.is_world_process_zero:
+                return
+            _recreate_dir(self.best_model_dir)
+            model.save_pretrained(self.best_model_dir)
+            tokenizer.save_pretrained(self.best_model_dir)
+
+    return TrainLossMonitorCallback()
 
 
 def _recreate_dir(path: Path) -> None:
