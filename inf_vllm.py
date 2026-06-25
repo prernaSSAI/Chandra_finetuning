@@ -25,6 +25,8 @@ from chandra_finetune.data import (
 from chandra_finetune.metrics import aggregate_metrics, clean_html, compute_metrics, parse_metric_names
 from prompts import PROMPT_MAPPING
 
+from augmentation import apply_noise, NOISE_PARAMS, NOISE_NAMES
+
 
 # ---------------------------------------------------------------------------
 # vLLM client helpers
@@ -223,12 +225,20 @@ def _process_one_page(
     reference_raw = sample.reference
     reference = clean_html(reference_raw) if reference_raw else reference_raw
 
+    # Clean/enhance the page image (CLAHE + gamma + brightness + contrast +
+    # sharpen) before OCR. .copy() so the original sample is left untouched.
+    cleaned_img = apply_noise(
+        sample.image.copy(),
+        NOISE_NAMES,
+        noise_params=NOISE_PARAMS,
+    )
+
     _t0 = time.perf_counter()
     try:
         prediction_raw = generate_text_vllm(
             vllm_url=args.vllm_url,
             model=args.vllm_model,
-            image=sample.image,
+            image=cleaned_img,
             prompt=prompt,
             max_new_tokens=args.max_new_tokens,
             request_timeout=args.request_timeout,

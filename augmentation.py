@@ -3,14 +3,19 @@ from typing import Any, Dict, List
 import numpy as np
 from PIL import Image
 import albumentations as A
-from augraphy.augmentations import (
-    BadPhotoCopy,
-    DirtyDrum,
-    LightingGradient,
-    ShadowCast,
-    Folding,
-    NoisyLines,
-)
+# augraphy is only used by build_augraphy_augmenters() (data augmentation), NOT by
+# the apply_noise cleaning path used during inference. Kept here for reference but
+# imported lazily inside that function, so this module loads with albumentations
+# alone. To use augraphy later: `pip install augraphy==8.2.6` and call
+# build_augraphy_augmenters() — no further code change needed.
+# from augraphy.augmentations import (
+#     BadPhotoCopy,
+#     DirtyDrum,
+#     LightingGradient,
+#     ShadowCast,
+#     Folding,
+#     NoisyLines,
+# )
 
 NOISE_PARAMS = {
     "clahe": {
@@ -179,6 +184,17 @@ def apply_augraphy_augmentation(
 
 
 def build_augraphy_augmenters():
+    # Lazy import: augraphy is only required when you actually build augmenters
+    # for data augmentation. Install it with `pip install augraphy==8.2.6`.
+    from augraphy.augmentations import (
+        BadPhotoCopy,
+        DirtyDrum,
+        LightingGradient,
+        ShadowCast,
+        Folding,
+        NoisyLines,
+    )
+
     return [
         BadPhotoCopy(
             noise_type=1,
