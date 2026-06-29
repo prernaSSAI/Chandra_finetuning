@@ -79,8 +79,8 @@ def generate_text_vllm(
     model: str,
     image: Any,
     prompt: str,
-    max_new_tokens: int = 12384,
-    request_timeout: int = 600,
+    max_new_tokens: int = 2048,
+    request_timeout: int = 900,
     retry_attempts: int = 5,
     retry_delay: float = 5.0,
 ) -> str:
@@ -169,12 +169,14 @@ class InferenceConfig:
     # Path to dataset artifact: Arrow dir, .pkl, .json, or .jsonl.
     dataset: str | None = None
     # Image path(s). Add one or more entries, e.g. ["a.png", "b.png"].
-    image: list[str] = field(default_factory=list)
+    image: list[str] = field(default_factory=lambda: [
+        "/mnt/disk/ml_data/prerna/data/Screenshot from 2026-06-26 16-55-50.png"
+    ])
     pdf: str | None = None                       # PDF path to render and process
     references_json: str | None = None           # optional page reference JSON for pdf inputs
     reference_field: str = "markdown"            # reference text field in references_json
     page_range: str | None = None                # PDF pages, e.g. "1-5,7,9"
-    dpi: int = 300                               # PDF render DPI
+    dpi: int = 600                               # PDF render DPI
     prompt_type: str = "ocr"                     # prompt for image/PDF inputs (key in PROMPT_MAPPING)
     override_prompt: str | None = None           # force this prompt for every sample
 
@@ -188,22 +190,22 @@ class InferenceConfig:
     # Model name as registered in vLLM --lora-modules.
     vllm_model: str = "chandra_lora"
     no_wait: bool = False                        # skip startup health-check
-    wait_timeout: int = 120                      # seconds to wait for the server to become ready
-    request_timeout: int = 300                   # per-request HTTP timeout in seconds
-    retry_attempts: int = 3                      # retries per sample on transient network errors
+    wait_timeout: int = 900                     # seconds to wait for the server to become ready
+    request_timeout: int = 900                   # per-request HTTP timeout in seconds
+    retry_attempts: int = 5                      # retries per sample on transient network errors
     retry_delay: float = 5.0                     # seconds between retries
     # Pages to process in parallel (1 = sequential). Set 4-8 for concurrent
     # inference with vLLM continuous batching.
-    concurrency: int = 1
+    concurrency: int = 25
 
     # ── Model (base checkpoint, for reference/metadata only) ────────────────
     model_name: str = DEFAULT_MODEL_NAME
 
     # ── Generation / output ─────────────────────────────────────────────────
     max_samples: int | None = None               # cap number of samples (debugging)
-    output: str = "predictions.json"             # JSON output path; must end with .json
+    output: str = "/mnt/disk/ml_data/prerna/iter_5/screenshot_pred.json"  # JSON output path; must end with .json
     metrics: str = "cer,wer,teds,table_teds"     # comma-separated metric names
-    max_new_tokens: int = 12384
+    max_new_tokens: int = 4096
 
 
 # ---------------------------------------------------------------------------
