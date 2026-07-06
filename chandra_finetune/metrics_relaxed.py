@@ -143,6 +143,12 @@ def teds_score(
     )
 
     if table_score is None:
+        # No scorable table on the page: the score is text + document structure.
+        # When the text is essentially perfect, the page is essentially correct,
+        # so a residual structure wobble (a stray wrapper/line-break) should not
+        # cap the page far below 1.0 — weight text heavily in that regime.
+        if text_score >= 0.95:
+            return _clamp((0.85 * text_score) + (0.15 * structure_score))
         return _clamp((0.65 * structure_score) + (0.35 * text_score))
 
     return _clamp((0.75 * table_score) + (0.20 * text_score) + (0.05 * structure_score))
@@ -959,15 +965,40 @@ def _match_tables(
             ref_total = sum(ref_counter.values())
             coverage = overlap / ref_total if ref_total else 0.0
             if coverage >= 0.60:
-                # Cap at 0.70 — table-rendered-as-text loses structural fidelity
-                # but content is intact, so this is a reasonable partial credit.
-                rescue_score = _clamp(0.50 + 0.20 * coverage)
+                # FIX 10 (content-aware rescue cap): the penalty for "rendered
+                # as text / wrong grouping" should depend on HOW MUCH structure
+                # the reference table actually had. A reference block that is
+                # mostly full-width prose (low tabularity) loses almost nothing
+                # by being flattened, so near-full content coverage should score
+                # high. A dense grid (high tabularity) that got flattened really
+                # did lose its structure, so it stays near the old 0.70 cap.
+                base = 0.50 + 0.20 * coverage
+                prose_bonus = 0.20 * (1.0 - _table_tabularity(ref)) * coverage
+                rescue_score = _clamp(min(0.92, base + prose_bonus))
                 matches.append((ref, TableFeatures(0, 0, 0, 0, 0, (), (), (), (), (), ()), rescue_score))
                 continue
 
         matches.append((ref, TableFeatures(0, 0, 0, 0, 0, (), (), (), (), (), ()), 0.0))
 
     return matches
+
+
+def _table_tabularity(table: TableFeatures) -> float:
+    """How grid-like a table actually is: the fraction of its meaningful rows
+    that are genuinely multi-column (>=2 direct cells spanning >=2 columns).
+    A real form/grid is ~1.0; a block that is mostly full-width prose rows
+    (instructions, notes) is near 0.0. Used by the content-aware rescue cap
+    (FIX 10) so that flattening a near-prose 'table' is barely penalized while
+    flattening a dense grid still is."""
+    meaningful = [i for i, tokens in enumerate(table.row_tokens) if tokens]
+    if not meaningful:
+        return 0.0
+    multi = sum(
+        1
+        for i in meaningful
+        if table.row_cell_counts[i] >= 2 and table.row_widths[i] >= 2
+    )
+    return multi / len(meaningful)
 
 
 def _unmatched_pred_indices(
@@ -1031,7 +1062,7 @@ def _row_recall_score(prediction: TableFeatures, reference: TableFeatures) -> tu
 
     unused_pred_indices = set(pred_indices)
     total = 0.0
-    missing = 0
+    unmatched_refs: list[int] = []
     for ref_index in ref_indices:
         best_index: int | None = None
         best_score = 0.0
@@ -1043,6 +1074,27 @@ def _row_recall_score(prediction: TableFeatures, reference: TableFeatures) -> tu
         if best_index is not None and best_score >= 0.35:
             unused_pred_indices.remove(best_index)
             total += best_score
+        else:
+            unmatched_refs.append(ref_index)
+
+    # FIX 9: merge-aware second pass. A ref row that found no free pred row of
+    # its own may simply have been MERGED into a pred row that already matched
+    # another ref row (the model concatenated several rowspan-grouped rows into
+    # one cell/row). If the ref row's tokens are largely contained in SOME pred
+    # row (used or not), credit it as a merge instead of counting it missing.
+    # Discounted (0.80) because structural fidelity was lost but content is
+    # intact. This rescues rowspan-flattening cases (e.g. change-history blocks).
+    missing = 0
+    for ref_index in unmatched_refs:
+        best_coverage = 0.0
+        for pred_index in pred_indices:
+            coverage = _token_recall(
+                reference.row_tokens[ref_index], prediction.row_tokens[pred_index]
+            )
+            if coverage > best_coverage:
+                best_coverage = coverage
+        if best_coverage >= 0.75:
+            total += 0.80 * best_coverage
         else:
             missing += 1
     return (total / len(ref_indices), missing, len(ref_indices))
@@ -1114,6 +1166,11 @@ def _document_structure(html: str) -> tuple[str, ...]:
             name = "td"
         if name in _TABLE_SECTION_TAGS:
             continue
+        # <br> is a purely cosmetic line break — a trailing/extra one must not
+        # count as a structural difference (it otherwise tanks the structure
+        # score of an otherwise-identical page).
+        if name == "br":
+            continue
         sequence.append(name)
     return tuple(sequence)
 
@@ -1140,6 +1197,21 @@ def _token_f1(prediction: tuple[str, ...] | list[str], reference: tuple[str, ...
     precision = overlap / sum(pred_counter.values())
     recall = overlap / sum(ref_counter.values())
     return (2 * precision * recall) / (precision + recall)
+
+
+def _token_recall(reference: tuple[str, ...] | list[str], prediction: tuple[str, ...] | list[str]) -> float:
+    """Fraction of the reference's tokens (by multiplicity) that appear in the
+    prediction. Used by the merge-aware row recall (FIX 9) to detect a ref row
+    whose content was folded into a larger pred row."""
+    if not reference:
+        return 1.0 if not prediction else 0.0
+    if not prediction:
+        return 0.0
+    ref_counter = Counter(reference)
+    pred_counter = Counter(prediction)
+    overlap = sum((ref_counter & pred_counter).values())
+    total = sum(ref_counter.values())
+    return overlap / total if total else 0.0
 
 
 def _tokens(text: str) -> list[str]:
@@ -1252,6 +1324,12 @@ def _normalize_text(text: str) -> str:
     # Pattern 6: collapse n/a, na, -na- to a single canonical token
     text = re.sub(r"\s*-\s*na\s*-\s*", " na ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bn\s*/\s*a\b", "na", text, flags=re.IGNORECASE)
+    # Split a digit->letter boundary so a missing space before a unit
+    # ("3.614kg") tokenizes the same as "3.614 kg". Applied symmetrically to
+    # pred and ref, so it only ever helps when one side dropped a space.
+    # Note: we deliberately do NOT split letter->digit ("g801-may-25"), which
+    # would fragment signature glyphs and alphanumeric codes and hurt matching.
+    text = re.sub(r"(?<=\d)(?=[a-zA-Z])", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip().lower()
 

@@ -79,12 +79,12 @@ def generate_text_vllm(
     model: str,
     image: Any,
     prompt: str,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int = 4096,
     request_timeout: int = 900,
     retry_attempts: int = 5,
     retry_delay: float = 5.0,
 ) -> str:
-    """Send one image+prompt to the vLLM server and return the generated text."""
+    """Send one image+prompt to the vLLM server and 2048return the generated text."""
     endpoint = vllm_url.rstrip("/") + "/v1/chat/completions"
     payload = _build_request_payload(
         model=model,
@@ -169,10 +169,8 @@ class InferenceConfig:
     # Path to dataset artifact: Arrow dir, .pkl, .json, or .jsonl.
     dataset: str | None = None
     # Image path(s). Add one or more entries, e.g. ["a.png", "b.png"].
-    image: list[str] = field(default_factory=lambda: [
-        "/mnt/disk/ml_data/prerna/data/Screenshot from 2026-06-26 16-55-50.png"
-    ])
-    pdf: str | None = None                       # PDF path to render and process
+    image: list[str] = field(default_factory=list)
+    pdf: str | None = "/mnt/disk/ml_data/prerna/data/AH250020.pdf"  # PDF path to render and process
     references_json: str | None = None           # optional page reference JSON for pdf inputs
     reference_field: str = "markdown"            # reference text field in references_json
     page_range: str | None = None                # PDF pages, e.g. "1-5,7,9"
@@ -203,7 +201,7 @@ class InferenceConfig:
 
     # ── Generation / output ─────────────────────────────────────────────────
     max_samples: int | None = None               # cap number of samples (debugging)
-    output: str = "/mnt/disk/ml_data/prerna/iter_5/screenshot_pred.json"  # JSON output path; must end with .json
+    output: str = "/mnt/disk/ml_data/prerna/iter3_recover_epoch8/complex/AH250020.json"  # JSON output path; must end with .json
     metrics: str = "cer,wer,teds,table_teds"     # comma-separated metric names
     max_new_tokens: int = 4096
 
@@ -254,7 +252,9 @@ def _process_one_page(
             "metadata": sample.metadata or {},
             "prompt": prompt,
             "reference": reference,
+            "reference_raw": reference_raw,
             "prediction": "",
+            "prediction_raw": "",
             "metrics": {},
             "gen_seconds": round(gen_seconds, 3),
             "error": str(exc),
@@ -263,12 +263,18 @@ def _process_one_page(
     gen_seconds = time.perf_counter() - _t0
     prediction = clean_html(prediction_raw)
     metrics = compute_metrics(prediction, reference, metric_names=metric_names)
+    # NOTE: metrics are computed on the CLEANED text only (fair comparison).
+    # The *_raw fields hold the unprocessed model output / ground truth, saved
+    # purely for debugging + visualization (e.g. to tell whether a dropped
+    # element was removed by clean_html or never produced by the model).
     return {
         "index": index,
         "metadata": sample.metadata or {},
         "prompt": prompt,
         "reference": reference,
+        "reference_raw": reference_raw,
         "prediction": prediction,
+        "prediction_raw": prediction_raw,
         "metrics": metrics,
         "gen_seconds": round(gen_seconds, 3),
     }

@@ -59,14 +59,14 @@ class TrainConfig:
     # ── Optimization ─────────────────────────────────────────────────────
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
-    warmup_steps: int = 50
+    warmup_steps: int = 100
     max_steps: int = -1                   # -1 = train for num_train_epochs
     num_train_epochs: float = 15.0
     learning_rate: float = 5e-5
     optim: str = "adamw_8bit"
     weight_decay: float = 0.05
     lr_scheduler_type: str = "cosine"
-    max_length: int = 2048
+    max_length: int = 4096
     logging_steps: int = 1
     logging_strategy: str = "epoch"
     disable_tqdm: bool = False
@@ -90,7 +90,7 @@ class TrainConfig:
     early_stopping_threshold: float = 0.0
     early_stopping_min_steps: int = 0
 
-    # ── Table-TEDS validation generation (only used when eval is enabled) ─
+    # ── Table-TEDS validation genegenemax_lenrationmax_lenration (only used when eval is enabled) ─
     eval_generation_max_new_tokens: int = 12384
     eval_generation_temperature: float = 0.0
     eval_generation_top_p: float = 1.0
