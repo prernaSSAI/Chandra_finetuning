@@ -20,6 +20,7 @@ Chandra_finetuning/
 ├── train_chandra.py               # LoRA fine-tuning entry point (edit TrainConfig, then run) — train_venv
 ├── infer_chandra.py               # Transformers/Unsloth in-process inference + evaluation (CLI) — train_venv
 ├── inf_vllm.py                    # vLLM server-based inference + evaluation (edit InferenceConfig, then run) — venv
+├── infer_all_checkpoints.py       # Loop inf_vllm inference over EVERY checkpoint in a folder + metrics summary — venv
 ├── visualize_predictions.py       # Render a predictions JSON to a side-by-side reference/prediction HTML page
 │
 ├── train_venv/                    # Training environment (Unsloth + trl, no vLLM)
@@ -191,7 +192,30 @@ python inf_vllm.py
 
 `vllm_model` in `InferenceConfig` must exactly match the name on the left of `=` in `--lora-modules`, and `vllm_url` must match the server's host/port. The client health-checks the server first and waits up to `wait_timeout` seconds; set `no_wait = True` only if the server is already confirmed up. Because the model loads once in terminal 1, re-run terminal 2 as often as you like without paying the model-load cost again — it also resumes automatically, skipping any page already written successfully (no `"error"` key) in the output file.
 
-### 5. `visualize_predictions.py` — side-by-side HTML viewer (either venv)
+### 5. `infer_all_checkpoints.py` — inference on ALL checkpoints in a folder (`venv`, two terminals)
+
+To evaluate every checkpoint in a folder (instead of one at a time via `inf_vllm.py`), use this. It writes `pred_<checkpoint>.json` per checkpoint and a `metrics_summary.json` into the same folder.
+
+**Terminal 1 — start the server** (the script prints the exact command with all checkpoints registered; copy-paste and run it, leave it running in tmux):
+
+```bash
+source venv/bin/activate
+python infer_all_checkpoints.py --print-server-cmd --iter-dir /mnt/disk/ml_data/prerna/iter_5
+# → copy-paste the printed `vllm serve ...` command and run it
+```
+
+**Terminal 2 — once the server is up, run the script:**
+
+```bash
+source venv/bin/activate
+python infer_all_checkpoints.py \
+  --iter-dir /mnt/disk/ml_data/prerna/iter_5 \
+  --dataset /mnt/disk/ml_data/prerna/final_arrow/test_36
+```
+
+Use the same `--iter-dir` in both terminals. Re-running resumes automatically (already-done pages are skipped).
+
+### 6. `visualize_predictions.py` — side-by-side HTML viewer (either venv)
 
 ```bash
 python visualize_predictions.py outputs/chandra_lora/predictions.json report.html
