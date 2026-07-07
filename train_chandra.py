@@ -30,9 +30,7 @@ DEFAULT_GREATER_IS_BETTER = True
 @dataclass
 class TrainConfig:
    
-
-   
-    dataset: str = "/mnt/disk/ml_data/prerna/finetune_train_data"
+    dataset: str = "/mnt/disk/ml_data/prerna/split_140dpi/train_140_dpi"
     # Optional held-out dataset for Table-TEDS validation. None = train-loss only.
     eval_dataset: str | None = None
     max_samples: int | None = None        # cap training samples (debugging)
@@ -46,8 +44,8 @@ class TrainConfig:
     # ── LoRA ─────────────────────────────────────────────────────────────
     load_in_4bit: bool = False
     gradient_checkpointing: str = "unsloth"  # "unsloth" | "true" | "false" | "none"
-    lora_r: int = 8
-    lora_alpha: int = 16
+    lora_r: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     use_rslora: bool = False
@@ -59,21 +57,23 @@ class TrainConfig:
     # ── Optimization ─────────────────────────────────────────────────────
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
-    warmup_steps: int = 100
+    warmup_steps: int = 50
     max_steps: int = -1                   # -1 = train for num_train_epochs
     num_train_epochs: float = 15.0
-    learning_rate: float = 5e-5
+    learning_rate: float = 3e-5
     optim: str = "adamw_8bit"
     weight_decay: float = 0.05
     lr_scheduler_type: str = "cosine"
-    max_length: int = 4096
+    # Image patches count toward max_length. At full 140dpi (~1190x1540) the
+    # image alone is ~1.8k tokens, so 4096 would truncate long HTML references.
+    max_length: int = 10240 #10240 
     logging_steps: int = 1
     logging_strategy: str = "epoch"
     disable_tqdm: bool = False
     report_to: str = "none"
 
     # ── Checkpointing / best-model selection ─────────────────────────────
-    eval_strategy: str = "no"             # "no" | "steps" | "epoch"
+    eval_strategy: str = "epoch"          # "no" | "steps" | "epoch"
     save_strategy: str = "epoch"          # "no" | "steps" | "epoch"
     load_best_model_at_end: bool = True   # auto-disabled when eval_dataset is None
     metric_for_best_model: str = DEFAULT_BEST_METRIC
@@ -261,7 +261,10 @@ def main() -> None:
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        data_collator=UnslothVisionDataCollator(model, tokenizer),
+        # resize="max" = no downscaling. The default ("min") falls back to a
+        # 512px width cap because qwen3_vl has no vision_config.image_size,
+        # which silently threw away the dataset's DPI.
+        data_collator=UnslothVisionDataCollator(model, tokenizer, resize="max"),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=SFTConfig(**trainer_kwargs),

@@ -1,0 +1,10 @@
+venv/
+train_venv/
+__pycache__/
+*.pyc
+final_splits/
+unsloth_compiled_cache/
+.gitignore
+outputs/
+Chandra_finetuning.zip
+pred_checkpoint-1323.recomputed.json
